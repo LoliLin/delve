@@ -261,6 +261,7 @@ def test_bfs_takes_a_step_that_shortens_the_distance():
     dx, dy = agent_loop.DIRS[step]
     landed = (1 + dx, 1 + dy)
     assert grid[landed[1]][landed[0]] not in agent_loop.BLOCKING
+
     def chebyshev(a, b):
         return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
@@ -269,9 +270,7 @@ def test_bfs_takes_a_step_that_shortens_the_distance():
 
 def test_the_agent_only_ever_returns_legal_commands():
     """The agent must not invent a verb the game does not know -- a typo costs a turn."""
-    allowed = re.compile(
-        r"^(move [a-z]{1,8}|use [a-z]+|wait|descend|quit|map|status|inv|legend|help)$"
-    )
+    allowed = re.compile(r"^(move [a-z]{1,8}|use [a-z]+|wait|descend|quit|map|status|inv|legend|help)$")
     for seed in (1, 4, 9):
         game = delve.new_game(seed=seed, depth=4)
         state: dict = {}

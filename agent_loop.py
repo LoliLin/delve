@@ -60,9 +60,7 @@ MONSTER_GLYPHS = set("rbjswG")
 # time it steps, which is an infinite loop that looks like progress.
 BLOCKING = set("# ")
 
-HEADER_RE = re.compile(
-    r"floor (?P<floor>\d+)/(?P<max_depth>\d+)\s+turn (?P<turn>\d+)\s+seed (?P<seed>\d+)"
-)
+HEADER_RE = re.compile(r"floor (?P<floor>\d+)/(?P<max_depth>\d+)\s+turn (?P<turn>\d+)\s+seed (?P<seed>\d+)")
 VITALS_RE = re.compile(
     r"HP (?P<hp>\d+)/(?P<max_hp>\d+)\s+"
     r"ATK (?P<atk>\d+)\((?P<atk_base>\d+)\+(?P<atk_gear>\d+)\)\s+"
@@ -144,9 +142,8 @@ def decide(observation: dict, state: dict) -> str:
         return "move " + neighbours[glyph]
 
     # 2. hurt with a potion in hand
-    if (
-        observation.get("hp", 1) * 100 <= observation.get("max_hp", 1) * 40
-        and "potion" in observation.get("inventory", {})
+    if observation.get("hp", 1) * 100 <= observation.get("max_hp", 1) * 40 and "potion" in observation.get(
+        "inventory", {}
     ):
         state["last"] = "use potion"
         return "use potion"
@@ -193,10 +190,7 @@ def decide(observation: dict, state: dict) -> str:
         # Prefer a route that avoids the monsters we can see; fall back to walking
         # through one (which means attacking it) only when there is no way around.
         monsters = {
-            (x, y)
-            for y, row in enumerate(grid)
-            for x, char in enumerate(row)
-            if char in MONSTER_GLYPHS
+            (x, y) for y, row in enumerate(grid) for x, char in enumerate(row) if char in MONSTER_GLYPHS
         }
         step = (
             _bfs_step(grid, start, {target}, monsters, ban)
