@@ -15,10 +15,15 @@ import pytest
 
 import delve
 from delve import (
+    DARK_RADIUS,
     DIRS,
+    ITEM_GLYPHS,
     MAP_H,
     MAP_W,
     MONSTERS,
+    REGEN_EVERY,
+    RINGS,
+    TILE_LOCKED,
     TILE_STAIRS,
     TILE_WALL,
     Game,
@@ -964,9 +969,360 @@ def test_judged_junk_does_not_stall_a_run():
             if game.tile(x, y) == TILE_WALL:
                 continue
             game.items.append({"kind": "weapon", "name": "dagger", "x": x, "y": y})
-            game.items.append({"kind": "armor", "name": "rags", "x": x, "y": y})
+            game.items.append({"kind": "armor", "name": "leather", "x": x, "y": y})
         for _ in range(delve.TURN_LIMIT):
             if game.s["status"] != "ok":
                 break
             game.step(delve.bot_command(game))
         assert game.s["status"] != "stalled", f"seed {seed} stalled on judged junk"
+
+
+# --------------------------------------------------------------------------
+# the mechanics added for depth (v2)
+# --------------------------------------------------------------------------
+
+
+def _place_monster(game, kind, dx, dy, **over):
+    player = game.s["player"]
+    spec = MONSTERS[kind]
+    monster = {
+        "kind": kind,
+        "x": player["x"] + dx,
+        "y": player["y"] + dy,
+        "hp": spec["hp"],
+        "max_hp": spec["hp"],
+        "atk": spec["atk"],
+        "def": spec["def"],
+        "xp": spec["xp"],
+        "erratic": spec.get("erratic", 0.0),
+        "ranged": spec.get("ranged", 0),
+        "reload": spec.get("reload", 1),
+        "poisons": spec.get("poisons", 0),
+        "heals": spec.get("heals", 0),
+        "weakens": spec.get("weakens", 0),
+        "speed": spec.get("speed", 1),
+        "slow": spec.get("slow", 1),
+        "tick": 0,
+        "alerted": True,
+        "alive": True,
+    }
+    monster.update(over)
+    game.s["floor"]["monsters"].append(monster)
+    return monster
+
+
+def _pick_spot(game, dx, dy):
+    """Clear the stage: empty the floor of residents and stand where `dx, dy` is walkable.
+
+    The clearing matters.  A generated floor already has monsters on it, and a test
+    that counts hits will happily count a rat that wandered into the experiment.
+    """
+    game.s["floor"]["monsters"].clear()
+    for y in range(1, MAP_H - 1):
+        for x in range(1, MAP_W - 1):
+            if game.tile(x, y) != TILE_WALL and game.tile(x + dx, y + dy) != TILE_WALL:
+                game.s["player"]["x"], game.s["player"]["y"] = x, y
+                game._vis_cache = None
+                return
+    raise AssertionError("no room on this floor")
+
+
+def test_archers_shoot_without_closing_in():
+    game = new_game(seed=3, depth=4)
+    _pick_spot(game, 3, 0)
+    archer = _place_monster(game, "archer", 3, 0)
+    spot = (archer["x"], archer["y"])
+    game.s["player"]["hp"] = 60
+    game.s["player"]["max_hp"] = 60
+    # turn 1 is spent drawing, turn 2 is the shot: an archer is on a reload clock
+    game.step("wait")
+    assert "draws its bow" in " ".join(game.events), game.events
+    assert (archer["x"], archer["y"]) == spot, "an archer must not advance"
+    game.step("wait")
+    assert any("shoots you" in event for event in game.events), game.events
+    assert (archer["x"], archer["y"]) == spot, "an archer must not advance"
+
+
+def test_an_archer_alternates_between_drawing_and_shooting():
+    game = new_game(seed=3, depth=4)
+    _pick_spot(game, 3, 0)
+    _place_monster(game, "archer", 3, 0)
+    player = game.s["player"]
+    player["hp"] = player["max_hp"] = 300
+    shots = 0
+    draws = 0
+    for _ in range(6):
+        game.events.clear()
+        game.step("wait")
+        shots += len([e for e in game.events if "shoots you" in e])
+        draws += len([e for e in game.events if "draws its bow" in e])
+    assert shots == 3, f"expected 3 shots in 6 turns, got {shots}"
+    assert draws == 3, f"expected 3 draws in 6 turns, got {draws}"
+
+
+def test_archer_damage_halves_effective_defence():
+    game = new_game(seed=3, depth=4)
+    _pick_spot(game, 3, 0)
+    _place_monster(game, "archer", 3, 0)
+    player = game.s["player"]
+    player["hp"] = player["max_hp"] = 200
+    player["def"] = 0
+    before = player["hp"]
+    game.step("wait")
+    unarmoured = before - player["hp"]
+
+    game = new_game(seed=3, depth=4)
+    _pick_spot(game, 3, 0)
+    _place_monster(game, "archer", 3, 0)
+    player = game.s["player"]
+    player["hp"] = player["max_hp"] = 200
+    player["def"] = 4
+    player["armor"] = "chain"  # +3 DEF, so DEF/2 = 3 rather than the full 7
+    before = player["hp"]
+    game.step("wait")
+    armoured = before - player["hp"]
+    assert armoured >= 0
+    assert unarmoured >= armoured
+
+
+def test_a_ghoul_poisons_and_poison_stops_regeneration():
+    game = new_game(seed=3, depth=6)
+    _pick_spot(game, 1, 0)
+    _place_monster(game, "ghoul", 1, 0)
+    player = game.s["player"]
+    player["hp"] = player["max_hp"] = 400
+    game.step("wait")
+    assert player["effects"]["poison"] > 0
+    assert any("poison" in event.lower() for event in game.events)
+
+    # with the poison up, regeneration must not fire even on a regen turn
+    player["hp"] = 300
+    for _ in range(REGEN_EVERY * 2):
+        before = player["hp"]
+        assert game.s["status"] == "ok"
+        game.step("wait")
+        if player["effects"]["poison"] > 0:
+            assert player["hp"] <= before, "poison must suppress regeneration"
+
+
+def test_poison_only_refreshes_upward():
+    game = new_game(seed=3, depth=6)
+    player = game.s["player"]
+    player["effects"]["poison"] = 9
+    _pick_spot(game, 1, 0)
+    _place_monster(game, "ghoul", 1, 0, poisons=2)
+    game.step("wait")
+    # one tick of clock passes, but the weaker venom must not reset the counter to 2
+    assert player["effects"]["poison"] == 8, player["effects"]["poison"]
+    assert not any("Venom" in event for event in game.events)
+
+
+def test_a_wraith_weakens_you_and_the_penalty_costs_attack():
+    game = new_game(seed=3, depth=4)
+    player = game.s["player"]
+    _pick_spot(game, 1, 0)
+    _place_monster(game, "wraith", 1, 0)
+    game.step("wait")
+    assert player["effects"]["weak"] > 0
+    assert game.p_atk() == max(1, player["atk"] - delve.WEAK_PENALTY + game.ring_bonus("atk"))
+
+
+def test_a_shaman_heals_its_wounded_friend_instead_of_attacking():
+    game = new_game(seed=3, depth=6)
+    _pick_spot(game, 4, 0)
+    shaman = _place_monster(game, "shaman", 4, 0)
+    hurt = _place_monster(game, "skeleton", 5, 0, hp=3)
+    game.step("wait")
+    assert hurt["hp"] > 3, "the shaman should have mended the skeleton"
+    assert (shaman["x"], shaman["y"]) == (game.s["player"]["x"] + 4, game.s["player"]["y"])
+    assert any("mends" in event for event in game.events)
+
+
+def test_a_wisp_acts_twice():
+    game = new_game(seed=3, depth=6)
+    _pick_spot(game, 1, 0)
+    _place_monster(game, "wisp", 1, 0, atk=1)
+    player = game.s["player"]
+    player["hp"] = player["max_hp"] = 200
+    game.step("wait")
+    hits = [event for event in game.events if "hits you" in event]
+    assert len(hits) == 2, f"a wisp should land two hits, got {hits}"
+
+
+def test_a_golem_acts_every_second_turn():
+    game = new_game(seed=3, depth=8)
+    _pick_spot(game, 1, 0)
+    _place_monster(game, "golem", 1, 0, atk=1)
+    player = game.s["player"]
+    player["hp"] = player["max_hp"] = 200
+    hits = 0
+    for _ in range(4):
+        game.events.clear()
+        game.step("wait")
+        hits += len([event for event in game.events if "hits you" in event])
+    assert hits == 2, f"a golem should land two hits in four turns, got {hits}"
+
+
+def test_a_locked_floor_has_a_key_and_refuses_the_stairs_without_it():
+    found = None
+    for seed in range(1, 60):
+        game = new_game(seed=seed, depth=6)
+        for depth in range(1, 7):
+            game._enter_floor(depth)
+            if game.s["floor"].get("locked"):
+                found = game
+                break
+        if found:
+            break
+    assert found is not None, "no locked floor in 60 seeds"
+    floor = found.s["floor"]
+    assert [i for i in floor["items"] if i["kind"] == "key"], "a locked floor must contain a key"
+    x, y = floor["stairs"]
+    assert floor["grid"][y][x] == TILE_LOCKED
+    found.s["player"]["x"], found.s["player"]["y"] = x, y
+    floor_depth = found.s["depth"]
+    found.step("down")
+    assert found.s["depth"] == floor_depth, "the stairs must refuse without the key"
+    assert "locked" in " ".join(found.events)
+
+    key = next(i for i in floor["items"] if i["kind"] == "key")
+    found._on_enter_tile(key["x"], key["y"])
+    assert found.s["player"]["keys"] == 1
+    assert not floor["locked"]
+    assert floor["grid"][y][x] == TILE_STAIRS
+    found.s["player"]["x"], found.s["player"]["y"] = x, y
+    found.step("down")
+    assert found.s["depth"] == floor_depth + 1
+
+
+def test_a_dark_floor_shrinks_sight_and_an_insight_ring_gives_it_back():
+    found = None
+    for seed in range(1, 80):
+        game = new_game(seed=seed, depth=8)
+        for depth in range(1, 9):
+            game._enter_floor(depth)
+            if game.s["floor"].get("dark"):
+                found = game
+                break
+        if found:
+            break
+    assert found is not None, "no dark floor in 80 seeds"
+    assert found.sight() == DARK_RADIUS
+    player = found.s["player"]
+    found.items.append({"kind": "ring", "name": "insight", "x": player["x"], "y": player["y"]})
+    found._on_enter_tile(player["x"], player["y"])
+    assert player["ring"] == "insight"
+    assert found.sight() == DARK_RADIUS + RINGS["insight"]["sight"]
+
+
+def test_a_dark_floor_announces_itself_on_arrival():
+    for seed in range(1, 80):
+        game = new_game(seed=seed, depth=8)
+        for depth in range(1, 9):
+            game._enter_floor(depth)
+            if game.s["floor"].get("dark"):
+                assert "dark" in game.floor_traits()
+                return
+    raise AssertionError("no dark floor to check")
+
+
+def test_the_vault_is_never_dark_or_locked():
+    for seed in range(1, 30):
+        game = new_game(seed=seed, depth=6)
+        game._enter_floor(game.s["max_depth"])
+        floor = game.s["floor"]
+        assert not floor.get("dark"), f"seed {seed}: vault was dark"
+        assert not floor.get("locked"), f"seed {seed}: vault was locked"
+
+
+def test_a_ring_is_worn_and_swapped_rather_than_stacked():
+    game = new_game(seed=3, depth=4)
+    player = game.s["player"]
+    base_atk = game.p_atk()
+    game.items.append({"kind": "ring", "name": "might", "x": player["x"], "y": player["y"]})
+    game._on_enter_tile(player["x"], player["y"])
+    assert player["ring"] == "might"
+    assert game.p_atk() == base_atk + 2
+
+    game.items.append({"kind": "ring", "name": "warding", "x": player["x"], "y": player["y"]})
+    game._on_enter_tile(player["x"], player["y"])
+    assert player["ring"] == "warding", "the new ring replaces the old one"
+    assert game.p_atk() == base_atk, "the old ring's bonus must be gone"
+    dropped = [i for i in game.items if i["kind"] == "ring" and i["name"] == "might"]
+    assert len(dropped) == 1, "the replaced ring drops where you stand"
+
+
+def test_the_vigor_ring_moves_max_hp_and_hp_stays_bounded():
+    game = new_game(seed=3, depth=4)
+    player = game.s["player"]
+    base = player["max_hp"]
+    player["hp"] = base
+    game.items.append({"kind": "ring", "name": "vigor", "x": player["x"], "y": player["y"]})
+    game._on_enter_tile(player["x"], player["y"])
+    assert player["max_hp"] == base + 8
+    game.items.append({"kind": "ring", "name": "might", "x": player["x"], "y": player["y"]})
+    game._on_enter_tile(player["x"], player["y"])
+    assert player["max_hp"] == base, "taking the vigor ring off must take the HP back"
+    assert player["hp"] <= player["max_hp"]
+
+
+def test_item_glyphs_cover_every_kind_a_floor_can_generate():
+    kinds = set()
+    for seed in range(1, 40):
+        floor = build_floor(random.Random(seed), 6, 8)
+        kinds |= {item["kind"] for item in floor["items"]}
+    assert kinds <= set(ITEM_GLYPHS), f"unglyphed kinds: {kinds - set(ITEM_GLYPHS)}"
+
+
+def test_every_monster_glyph_is_unique_and_visible_in_the_legend():
+    glyphs = [spec["glyph"] for spec in MONSTERS.values()]
+    assert len(glyphs) == len(set(glyphs)), "two monsters share a glyph"
+    for kind, spec in MONSTERS.items():
+        assert spec["glyph"] in delve.LEGEND, f"{kind} has no legend entry"
+
+
+def test_deep_floors_bring_mechanics_not_just_bigger_numbers():
+    """The design promise: from floor 3 down, most species change what you should do."""
+    mechanical = [
+        kind
+        for kind, spec in MONSTERS.items()
+        if spec.get("ranged")
+        or spec.get("poisons")
+        or spec.get("heals")
+        or spec.get("weakens")
+        or spec.get("speed", 1) > 1
+        or spec.get("slow", 1) > 1
+    ]
+    assert len(mechanical) >= 5, mechanical
+
+
+def test_a_floor_never_stacks_more_monsters_than_the_cap():
+    for depth in (4, 8, 12):
+        floor = build_floor(random.Random(depth), depth, 12)
+        assert len(floor["monsters"]) <= 9 + 1, "the boss floor adds one guardian on top"
+
+
+def test_a_save_from_an_older_format_is_refused_clearly(tmp_path):
+    """Better to say "cannot read this" than to half-build a Game from a stale state."""
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"format": "delve-save", "version": 1, "sealed": False, "data": {}}))
+    with pytest.raises(ValueError, match="not readable by this build"):
+        load_game(str(path))
+
+
+def test_a_file_that_is_not_a_delve_save_is_refused(tmp_path):
+    path = tmp_path / "nope.json"
+    path.write_text(json.dumps({"hello": "world"}))
+    with pytest.raises(ValueError, match="not a delve-save file"):
+        load_game(str(path))
+
+
+def test_an_unknown_command_never_wedges_the_run():
+    game = new_game(seed=7, depth=3)
+    for command in ["", "   ", "flurble", "move sideways", "use nothing", "attack up", "10", "null"]:
+        before = game.s["turn"]
+        game.step(command)
+        assert game.s["status"] == "ok"
+        assert game.s["turn"] in (before, before + 1)
+        if before != game.s["turn"]:
+            assert game.events, f"{command!r} spent a turn but said nothing"

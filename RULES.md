@@ -110,10 +110,27 @@ there is no separate close-combat verb beyond this.
 | `j` | slime | 9 | 3 | 1 | 7 | 2–5 |
 | `s` | skeleton | 11 | 4 | 2 | 9 | 2+ |
 | `w` | wraith | 15 | 6 | 3 | 16 | 3+ |
+| `a` | archer | 10 | 4 | 1 | 15 | 3+ |
+| `g` | ghoul | 13 | 5 | 1 | 14 | 4+ |
+| `h` | shaman | 14 | 4 | 2 | 18 | 5+ |
+| `W` | wisp | 9 | 5 | 2 | 17 | 5+ |
+| `o` | golem | 30 | 8 | 5 | 30 | 6+ |
 | `G` | guardian | scaled | scaled | scaled | 60 | vault |
 
-Population is `3 + depth` per floor, drawn from the species whose floor range covers
-the depth. The guardian appears only on the vault floor, plus 2 normal guards.
+Population is `3 + depth`, capped at 9 per floor, drawn from the species whose floor
+range covers the depth. The guardian appears only on the vault floor, plus 2 normal
+guards.
+
+**The deep floors are not bigger numbers.** From floor 3 down, each monster has a
+mechanic that changes what you should do, not just how long you can stand there:
+
+| monster | mechanic | what it means for you |
+|---|---|---|
+| archer | shoots at range 4 with line of sight, never closes in, and must spend a turn drawing each arrow | you take a hit every *other* turn while closing. Break the sight line, or time your approach |
+| ghoul | its hits poison you | poison suppresses regeneration, so disengaging does not heal you |
+| shaman | heals wounded monsters within 5 tiles | kill it first, or you fight the same HP bar repeatedly |
+| wisp | acts **twice** per turn | standing next to one at low HP is how runs end |
+| golem | acts every **second** turn | it is slow, so walking away from it is genuinely viable |
 
 ### Behaviour
 
@@ -125,6 +142,34 @@ the depth. The guardian appears only on the vault floor, plus 2 normal guards.
 - **Bats are erratic**: 50% of their moves are a random walk instead of a pursuit.
   Their chase is therefore not reliably predictable — do not assume a bat will
   come to you on the line you calculated.
+- **Archers do not advance, and they must reload.** If they see you at distance ≤ 4 they
+  shoot — but only every *second* turn; the other turn is spent drawing, announced as "The
+  archer draws its bow". A shot lands for `atk + 0..2 - DEF/2` (half your defence, rounded
+  down). The `a` glyph is the whole warning; the useful answers are breaking line of sight,
+  or closing in while counting the reload so you eat one hit instead of three.
+- **Shamans mend before they chase.** A shaman that has not even seen you still heals
+  the worst-hurt monster within 5 tiles by `3 + max_hp/4`, capped at that monster's max
+  HP. While one is alive, damage you deal to anything else may be undone.
+- **Wisps act twice per turn; golems act every second turn.** Each monster has its own
+  clock that advances once per turn: a slow monster acts only when the clock is a
+  multiple of its factor, a fast one repeats its action that many times.
+- Monsters never flee, never open doors (there are none), and never regenerate on their
+  own — only a shaman puts HP back.
+
+### Effects on you
+
+Two monsters can leave something behind that keeps hurting after you disengage. These
+show on the `EFFECTS` line, which is **absent entirely when nothing is active** — so a
+line that appears is a warning:
+
+| effect | source | effect |
+|---|---|---|
+| `poison N` | ghoul | `1` damage per turn for `N` turns, and **regeneration is suppressed while poisoned** |
+| `weak N` | wraith | `-2 ATK` for `N` turns |
+
+Poison overriding regeneration is the point: `1` damage per turn would be trivial alone,
+but it means you cannot outlast a ghoul by walking away. `N` only rises — a weaker poison
+never overwrites a stronger one.
 - Monsters never flee, never open doors (there are none), and never regenerate.
 
 ## Items
@@ -136,11 +181,15 @@ the depth. The guardian appears only on the vault floor, plus 2 normal guards.
 | `$` | gold | picked up on step, score only |
 | `)` | weapon | **auto-equipped on step if strictly better** |
 | `[` | armor | same for DEF |
+| `=` | ring | worn on step; **traded against the current ring, not stacked** |
+| `k` | key | opens this floor's locked staircase |
 
 Gear is auto-compared on step: walking onto a weapon/armour with a strictly higher
 bonus equips it and the event line says so; otherwise the event says it is no better
-and **the item is consumed/left behind** — it does not linger to be re-evaluated, so
-a player cannot farm the same tile for decisions. Gear tables:
+and **the item stays where it lies**, flagged as already judged. Stepping on it again
+says only that it is still no better. Nothing about the map gets rewritten to stop you
+re-checking — the item is still there, and a player that keeps targeting it will still
+walk to it. Keeping track of what you already rejected is the player's job. Gear tables:
 
 | weapon | atk | floors | | armor | def | floors |
 |---|---|---|---|---|---|---|
@@ -148,6 +197,39 @@ a player cannot farm the same tile for decisions. Gear tables:
 | sword | 2 | 2–4 | | chain | 2 | 2+ |
 | axe | 3 | 3+ | | plate | 3 | 4+ |
 | rune blade | 4 | 4+ | | | | |
+
+### Rings
+
+A ring is **worn, not collected**: stepping on one wears it, and a ring you were already
+wearing drops on the tile you are standing on — so stepping off and back swaps them
+again. There is no "best" ring; they answer different questions.
+
+| ring | effect |
+|---|---|
+| `might` | `+2 ATK` |
+| `warding` | `+2 DEF` |
+| `vigor` | `+8 max HP` (taken back off when the ring comes off) |
+| `insight` | `+2 sight radius` — the answer to a dark floor |
+| `greed` | gold is worth double |
+
+Rings appear on about a third of floors, shown as `=` on the board.
+
+### Floor features
+
+Both are announced on the `FLOOR` line the moment you arrive, because nothing in this
+game is allowed to be a rule you could not have known:
+
+| trait | chance | effect |
+|---|---|---|
+| `dark` | 30% on floors 3+ | sight radius drops from 8 to **2** |
+| `stairs locked` | 35% on floors 2+ | the staircase is sealed (`+` on the board) until you bring the key |
+
+A locked floor always puts a key (`k`) somewhere you can reach, and picking it up
+announces that the stairs unlatched — you do not have to go back and check. A dark floor
+is survivable: it just means you genuinely do not know what is four tiles away, and an
+`insight` ring or a `mapping` scroll buys that knowledge back.
+
+The vault floor is never dark and never locked.
 
 ### Scrolls (the interesting ones)
 
@@ -188,28 +270,41 @@ Text mode is **exact and stable**, in this order, every turn:
 ```
 -- DELVE  floor N/M   turn T   seed S --
 HP h/max  ATK t(b+g)  DEF t(b+g)  LV L  xp x/xn  GOLD g
-GEAR  weapon X   armor Y   INV item xN, ...
+GEAR  weapon X   armor Y   ring Z   INV item xN, ...
+FLOOR   nothing unusual | dark (sight 2) | stairs locked | both, comma-separated
+EFFECTS poison 3, weak 2 (-2 ATK)          <- only present while something is active
 MAP
   <40 columns, 2-space indent>
 TARGETS  name(dir hp h/m)  ...   |  none
 GROUND   gold(7), potion, ...    |  none
-STAIRS   here | seen | unknown | none
+LOOT     potion(ne)  armor(nw, judged)  ...  |  none
+STAIRS   here | seen | unknown | none   (+ " (locked)")
 EVENT
   - one line per thing that happened this turn
-RESULT ok | win | dead | stalled | quit
+CAUSE    slain by a wraith on floor 3       <- only present once the run is over
+RESULT ok | win | dead | stalled | quit     <- ALWAYS the final line
+LEGEND   ...                                <- only with --legend, before RESULT
 ```
 
-- **The last line of a turn is always `RESULT <status>`**, so a harness can regex the
-  outcome without parsing anything else. With `--legend` the legend line comes after
-  `RESULT`; with `--strict-exit` the process exit code mirrors it
+- **The last line of a turn is always `RESULT <status>`**, with or without `--legend`, so
+  `tail -1` is a correct harness. With `--strict-exit` the process exit code mirrors it
   (`10` win / `11` dead / `12` stalled / `13` quit, else `0`).
 - `TARGETS` lists only monsters **currently visible**, with direction and exact HP —
   exact HP is deliberate: it lets an agent compute how many swings a kill takes.
-- `STAIRS` is one word: `here` (you are on them), `seen` (they are inside your
-  remembered map), `unknown` (not located yet), `none` (vault floor).
+- `LOOT` is the same information for items that are visible but **not** underfoot, by
+  direction. An item the player has already passed on is marked `judged` so an agent does
+  not have to keep a map of its own to remember. `GROUND` covers what is underfoot.
+- `EFFECTS` is **absent entirely** when nothing is active, so a line that appears is a
+  warning rather than noise.
+- `FLOOR` reports a floor's traits the moment you arrive. Both traits present in the game
+  (`dark`, `stairs locked`) are announced here and neither is ever hidden.
+- `CAUSE` names how the run ended, in words a human can read: `slain by a ghoul on floor 4`,
+  `ran out of turns on floor 7`, `abandoned the run on floor 2`, `took the relic on floor 6`.
+- `STAIRS` is one word: `here` (you are on them), `seen` (inside your remembered map),
+  `unknown` (not located), `none` (vault floor), plus ` (locked)` when they are sealed.
 - `--format json` emits the identical information as one JSON object per turn
-  (keys: `result, seed, floor, max_depth, turn, player{...}, map{rows[]}, legend,
-  targets[], ground[], stairs, events[]`).
+  (keys: `result, cause, game_version, seed, floor, max_depth, turn, player{...},
+  map{rows[]}, legend, targets[], ground[], loot[], floor_traits, stairs, events[]`).
 
 `--view full|window|none` controls how much board is drawn (`window` = 25×11 around
 the player, `none` = suppressed). It changes rendering only — **never** the simulation.
@@ -283,7 +378,7 @@ expected to beat.
 
 ## Verification
 
-`delve selftest` runs the internal checks, including:
+`delve selftest` runs the internal checks (26 of them), including:
 
 - every generated floor is fully connected and the stairs reachable; no entity is
   placed inside a wall or on the start tile
@@ -293,5 +388,18 @@ expected to beat.
 - free commands really are free
 - **an unseen monster is never drawn** (no information leak through the map)
 - death is reachable, and a kill + relic step produces `win`
+- every generated item kind has a glyph, every monster glyph is in the legend, and
+  monsters do not share a glyph
+- every locked floor actually contains a key, and its staircase really is drawn locked
+- dark floors occur, and they really do shrink sight
+- a vigor ring's `max_hp` comes back off when the ring does
+- poison suppresses regeneration and still ticks every turn
 - the baseline bot wins at least one seed, never returns an unknown command, and
   does not step straight back and forth
+
+`pytest` adds ~190 unit and end-to-end tests on top of that, and a fuzzer used while
+building this version (not shipped) hammered random command streams for state invariants:
+grid size, entity positions, monster stacking, HP bounds, save/load round-trips, the
+`RESULT`-is-last-line contract, and the unseen-monster leak. It found the corpse that kept
+regenerating, the item that was deleted while the message said it stayed, the event log
+that did not survive a reload, and the carried key that could not open a locked staircase.

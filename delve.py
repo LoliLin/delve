@@ -28,18 +28,18 @@ import random
 import sys
 import tempfile
 
-GAME_VERSION = 1
+GAME_VERSION = 2
 
 SAVE_FORMAT = "delve-save"
-SAVE_VERSION = 1
+SAVE_VERSION = 2
 SAVE_XOR_KEY = b"delve/v1/obfuscation-not-encryption"
 
 MAP_W = 40
 MAP_H = 14
 FOV_RADIUS = 8
-DEFAULT_DEPTH = 5
-MAX_DEPTH_ALLOWED = 12
-TURN_LIMIT = 2000
+DEFAULT_DEPTH = 8
+MAX_DEPTH_ALLOWED = 20
+TURN_LIMIT = 6000
 REGEN_EVERY = 14
 DEFAULT_SAVE = "delve-save.json"
 MONSTER_SIGHT = 7
@@ -47,11 +47,25 @@ MONSTER_SIGHT = 7
 TILE_WALL = "#"
 TILE_FLOOR = "."
 TILE_STAIRS = ">"
+TILE_LOCKED = "+"
 
 GLYPH_REMEMBERED_FLOOR = ":"
 GLYPH_TRAP = "^"
 GLYPH_PLAYER = "@"
 GLYPH_RELIC = "*"
+
+# One place that decides what a thing looks like.  `selftest` asserts every item
+# kind has an entry, so adding a kind without a glyph fails loudly instead of
+# rendering a mystery character.
+ITEM_GLYPHS = {
+    "gold": "$",
+    "potion": "!",
+    "scroll": "?",
+    "weapon": ")",
+    "armor": "[",
+    "ring": "=",
+    "key": "k",
+}
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -63,7 +77,23 @@ MONSTERS = {
     "bat": {"glyph": "b", "hp": 3, "atk": 2, "def": 0, "xp": 4, "floors": (1, 3), "erratic": 0.5},
     "slime": {"glyph": "j", "hp": 9, "atk": 3, "def": 1, "xp": 7, "floors": (2, 5)},
     "skeleton": {"glyph": "s", "hp": 11, "atk": 4, "def": 2, "xp": 9, "floors": (2, 99)},
-    "wraith": {"glyph": "w", "hp": 15, "atk": 6, "def": 3, "xp": 16, "floors": (3, 99)},
+    "wraith": {"glyph": "w", "hp": 15, "atk": 6, "def": 3, "xp": 16, "floors": (3, 99), "weakens": 3},
+    # The deep floors are not just bigger numbers.  Each of these changes what you
+    # should do, not only how long you can stand there.
+    "archer": {
+        "glyph": "a",
+        "hp": 10,
+        "atk": 4,
+        "def": 1,
+        "xp": 15,
+        "floors": (3, 99),
+        "ranged": 4,
+        "reload": 2,
+    },
+    "ghoul": {"glyph": "g", "hp": 13, "atk": 5, "def": 1, "xp": 14, "floors": (4, 99), "poisons": 4},
+    "shaman": {"glyph": "h", "hp": 14, "atk": 4, "def": 2, "xp": 18, "floors": (5, 99), "heals": 5},
+    "wisp": {"glyph": "W", "hp": 9, "atk": 5, "def": 2, "xp": 17, "floors": (5, 99), "speed": 2},
+    "golem": {"glyph": "o", "hp": 30, "atk": 8, "def": 5, "xp": 30, "floors": (6, 99), "slow": 2},
     "guardian": {"glyph": "G", "hp": 44, "atk": 9, "def": 4, "xp": 60, "floors": ("boss",)},
 }
 
@@ -81,6 +111,22 @@ ARMORS = {
 }
 
 SCROLL_KINDS = ("mapping", "teleport", "blessing", "ward")
+
+# Rings trade against each other instead of stacking, so wearing one is a decision
+# rather than an upgrade.  `insight` and `greed` in particular are not "worse" than
+# `might`, they answer a different question.
+RINGS = {
+    "might": {"note": "+2 ATK", "atk": 2},
+    "warding": {"note": "+2 DEF", "def": 2},
+    "vigor": {"note": "+8 max HP", "max_hp": 8},
+    "insight": {"note": "+2 sight radius", "sight": 2},
+    "greed": {"note": "double gold", "gold": 2},
+}
+
+# Temporary effects on the player.  They exist to make *when* you act matter.
+POISON_DAMAGE = 1
+WEAK_PENALTY = 2
+DARK_RADIUS = 2
 
 PLAYER_BASE_HP = 26
 PLAYER_BASE_ATK = 4
@@ -114,17 +160,25 @@ LEGEND = {
     ".": "floor in sight",
     ":": "floor remembered, not in sight",
     ">": "stairs down",
+    "+": "stairs down, locked",
     "r": "rat",
     "b": "bat",
     "j": "slime",
     "s": "skeleton",
     "w": "wraith",
+    "a": "archer (shoots at range 4, must reload)",
+    "g": "ghoul (its hits poison)",
+    "h": "shaman (heals other monsters)",
+    "W": "wisp (acts twice per turn)",
+    "o": "golem (acts every other turn)",
     "G": "guardian",
     "!": "potion",
     "?": "scroll",
     "$": "gold",
     ")": "weapon",
     "[": "armor",
+    "=": "ring",
+    "k": "key (opens the locked stairs)",
     "*": "relic",
     "^": "trap you already know about",
     " ": "never seen",
@@ -160,12 +214,16 @@ READING THE STATUS BLOCK
   HP 19/26  ATK 5(4+1)  DEF 2(1+1)  LV 2  xp 14/20  GOLD 41
                                                 numbers; (base+gear), LV is your level
   GEAR ...  INV ...                             equipped gear and what you carry
+  FLOOR   nothing unusual                       traits of this floor; announced on arrival
+  EFFECTS poison 3, weak 2 (-2 ATK)             only printed while something is on you
   MAP                                           the board, 2-space indented
   TARGETS  rat(e hp 3/4)                        monsters you can currently see, direction + HP
   GROUND   gold(7), potion                      items lying at your feet
-  STAIRS   here | seen | unknown                where the way down is
+  LOOT     potion(ne)  armor(nw, judged)        other visible items, by direction
+  STAIRS   here | seen | unknown (+ (locked))   where the way down is
   EVENT                                         what just happened
-  RESULT ok | win | dead | stalled              last line, always; `stalled` = turn limit hit
+  CAUSE    slain by a wraith on floor 3         printed once the run is over
+  RESULT ok | win | dead | stalled | quit       always the FINAL line; `stalled` = turn limit hit
 
 WHAT THE CARD DOES NOT TELL YOU
   How the world actually behaves: what each monster does, how much a potion really
@@ -205,6 +263,11 @@ def _line(x0: int, y0: int, x1: int, y1: int) -> list[tuple[int, int]]:
 
 def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def _with_article(word: str) -> str:
+    """'wraith' -> 'a wraith', 'archer' -> 'an archer'.  Death causes are read by humans."""
+    return f"{'an' if word[:1].lower() in 'aeiou' else 'a'} {word}"
 
 
 def dir_name(dx: int, dy: int) -> str:
@@ -253,15 +316,31 @@ def _carve(rng: random.Random, grid: list[list[str]], a: tuple[int, int], b: tup
 # --------------------------------------------------------------------------
 
 
-def _pick_monsters(rng: random.Random, depth: int, count: int) -> list[str]:
+def _pick_monsters(rng: random.Random, depth: int, count: int, mechanical_only: bool = False) -> list[str]:
     pool = [
         name
         for name, spec in MONSTERS.items()
         if spec["floors"] != ("boss",) and spec["floors"][0] <= depth <= spec["floors"][1]
     ]
+    if mechanical_only:
+        pool = [name for name in pool if has_mechanic(MONSTERS[name])] or pool
     if not pool:
         pool = ["rat"]
     return [rng.choice(pool) for _ in range(count)]
+
+
+def has_mechanic(spec: dict) -> bool:
+    """True for anything that is more than a pile of stats."""
+    return bool(
+        spec.get("erratic")
+        or spec.get("ranged")
+        or spec.get("poisons")
+        or spec.get("heals")
+        or spec.get("weakens")
+        or spec.get("speed", 1) > 1
+        or spec.get("slow", 1) > 1
+        or spec.get("reload", 1) > 1
+    )
 
 
 def _pick_gear(rng: random.Random, table: dict, depth: int) -> str | None:
@@ -345,20 +424,40 @@ def build_floor(rng: random.Random, depth: int, max_depth: int) -> dict:
         used.add(spot)
         return spot
 
+    # floor features -------------------------------------------------------
+    # Both are announced in the FLOOR block the moment you arrive.  Nothing in
+    # this game is allowed to be a rule the player could not have known.
+    dark = (not is_boss) and depth >= 3 and rng.random() < 0.3
+    locked = (not is_boss) and depth >= 2 and rng.random() < 0.35
+    floor["dark"] = dark
+    floor["locked"] = locked
+    if locked:
+        _set_grid_tile(floor, floor["stairs"][0], floor["stairs"][1], TILE_LOCKED)
+
     # monsters
     if is_boss:
         floor["monsters"].append(_make_monster("guardian", special, guardian_stats(max_depth)))
         names = _pick_monsters(rng, depth, 2)
     else:
-        names = _pick_monsters(rng, depth, 3 + depth)
+        names = _pick_monsters(rng, depth, min(3 + depth, 9))
+        # Past the early floors, guarantee that a floor poses a *tactical* problem and
+        # not just an arithmetic one: at least one monster that changes how you fight.
+        if depth >= 7:
+            tricky = _pick_monsters(rng, depth, 3, mechanical_only=True)
+            for name in tricky[: 1 + depth // 10]:
+                if names:
+                    names[rng.randrange(len(names))] = name
+                else:
+                    names.append(name)
+    scale = None if is_boss else threat_scale(depth)
     for name in names:
         spot = take(4)
         if spot is None:
             break
-        floor["monsters"].append(_make_monster(name, spot))
+        floor["monsters"].append(_make_monster(name, spot, scale=scale))
 
     # loot
-    gold_piles = 2 if is_boss else 3 + depth
+    gold_piles = 2 if is_boss else min(3 + depth, 9)
     for _ in range(gold_piles):
         spot = take(3)
         if spot is None:
@@ -367,30 +466,45 @@ def build_floor(rng: random.Random, depth: int, max_depth: int) -> dict:
             {"kind": "gold", "x": spot[0], "y": spot[1], "amount": rng.randint(3, 9) + depth}
         )
 
-    potions = 1 + (1 if depth >= 3 else 0)
+    if locked:
+        spot = take(3)
+        if spot is not None:
+            floor["items"].append({"kind": "key", "x": spot[0], "y": spot[1]})
+        else:
+            floor["locked"] = False
+
+    potions = 1 + (1 if depth >= 3 else 0) + (1 if depth >= 9 else 0)
     for _ in range(potions):
         spot = take(3)
         if spot is None:
             break
         floor["items"].append({"kind": "potion", "x": spot[0], "y": spot[1]})
 
-    spot = take(3)
-    if spot is not None:
+    scrolls = 1 + (1 if depth >= 6 else 0)
+    for _ in range(scrolls):
+        spot = take(3)
+        if spot is None:
+            break
         floor["items"].append({"kind": "scroll", "x": spot[0], "y": spot[1]})
 
-    if rng.random() < 0.7:
+    if rng.random() < 0.75:
         name = _pick_gear(rng, WEAPONS, depth)
         spot = take(3)
         if name and spot is not None:
             floor["items"].append({"kind": "weapon", "name": name, "x": spot[0], "y": spot[1]})
-    if rng.random() < 0.6:
+    if rng.random() < 0.65:
         name = _pick_gear(rng, ARMORS, depth)
         spot = take(3)
         if name and spot is not None:
             floor["items"].append({"kind": "armor", "name": name, "x": spot[0], "y": spot[1]})
+    if rng.random() < 0.35:
+        ring = rng.choice(sorted(RINGS))
+        spot = take(3)
+        if spot is not None:
+            floor["items"].append({"kind": "ring", "name": ring, "x": spot[0], "y": spot[1]})
 
     # traps
-    trap_count = rng.randint(0, 1) if is_boss else rng.randint(1, 3)
+    trap_count = rng.randint(0, 1) if is_boss else rng.randint(1, min(1 + depth // 3, 4))
     for _ in range(trap_count):
         spot = take(4)
         if spot is None:
@@ -400,10 +514,39 @@ def build_floor(rng: random.Random, depth: int, max_depth: int) -> dict:
     return floor
 
 
-def _make_monster(name: str, spot: tuple[int, int], stats: dict | None = None) -> dict:
+def _set_grid_tile(floor: dict, x: int, y: int, glyph: str) -> None:
+    """The grid is stored as a list of strings, so a one-character edit rebuilds the row."""
+    row = floor["grid"][y]
+    floor["grid"][y] = row[:x] + glyph + row[x + 1 :]
+
+
+def threat_scale(depth: int) -> dict:
+    """A gently growing threat for floors past the early game.
+
+    Mechanics are what make a floor interesting; this exists only so that floor 15 is
+    not a victory lap.  The overall win rate is meant to stay roughly flat across
+    --depth (that is what `guardian_stats` is for) -- but without this, all the danger
+    piles up on floors 2-5 while the player out-levels everything after that, and the
+    back half of a long run stops being a game.
+
+    Deliberately mild: HP x1.00 at floor 5 rising to x1.75 at floor 20, +3 ATK and
+    +2 DEF at floor 20.
+    """
+    past = max(0, depth - 5)
+    return {"hp": 1 + 0.07 * past, "atk": past // 3, "def": past // 5}
+
+
+def _make_monster(
+    name: str, spot: tuple[int, int], stats: dict | None = None, scale: dict | None = None
+) -> dict:
     spec = dict(MONSTERS[name])
     if stats:
+        # An explicitly-statted monster (the guardian) is already scaled to the run.
         spec.update(stats)
+    elif scale:
+        spec["hp"] = max(1, round(spec["hp"] * scale["hp"]))
+        spec["atk"] += scale["atk"]
+        spec["def"] += scale["def"]
     return {
         "kind": name,
         "x": spot[0],
@@ -414,6 +557,14 @@ def _make_monster(name: str, spot: tuple[int, int], stats: dict | None = None) -
         "def": spec["def"],
         "xp": spec["xp"],
         "erratic": spec.get("erratic", 0.0),
+        "ranged": spec.get("ranged", 0),
+        "reload": spec.get("reload", 1),
+        "poisons": spec.get("poisons", 0),
+        "heals": spec.get("heals", 0),
+        "weakens": spec.get("weakens", 0),
+        "speed": spec.get("speed", 1),
+        "slow": spec.get("slow", 1),
+        "tick": 0,
         "alerted": False,
         "alive": True,
     }
@@ -479,15 +630,25 @@ class Game:
             return self.grid[y][x]
         return TILE_WALL
 
+    def ring_bonus(self, key: str) -> int:
+        ring = self.s["player"].get("ring")
+        return RINGS[ring].get(key, 0) if ring else 0
+
     def p_atk(self) -> int:
         player = self.s["player"]
         bonus = WEAPONS[player["weapon"]]["atk"] if player["weapon"] else 0
-        return player["atk"] + bonus
+        weak = WEAK_PENALTY if player.get("effects", {}).get("weak") else 0
+        return max(1, player["atk"] + bonus + self.ring_bonus("atk") - weak)
 
     def p_def(self) -> int:
         player = self.s["player"]
         bonus = ARMORS[player["armor"]]["def"] if player["armor"] else 0
-        return player["def"] + bonus
+        return player["def"] + bonus + self.ring_bonus("def")
+
+    def sight(self) -> int:
+        """How far the torch reaches.  Dark floors really change what you can know."""
+        base = DARK_RADIUS if self.s["floor"].get("dark") else FOV_RADIUS
+        return base + self.ring_bonus("sight")
 
     def live_monsters(self) -> list[dict]:
         return [m for m in self.monsters if m["alive"]]
@@ -525,7 +686,7 @@ class Game:
     def visible_tiles(self) -> set[tuple[int, int]]:
         px, py = self.px, self.py
         vis = {(px, py)}
-        r = FOV_RADIUS
+        r = self.sight()
         for y in range(max(0, py - r), min(MAP_H - 1, py + r) + 1):
             for x in range(max(0, px - r), min(MAP_W - 1, px + r) + 1):
                 if (x - px) ** 2 + (y - py) ** 2 > r * r:
@@ -551,6 +712,15 @@ class Game:
         player = self.s["player"]
         player["x"], player["y"] = floor["start"][0], floor["start"][1]
 
+    def _tick_effects(self) -> None:
+        effects = self.s["player"].setdefault("effects", {"poison": 0, "weak": 0})
+        if effects.get("poison", 0) > 0:
+            effects["poison"] -= 1
+            self._hurt(POISON_DAMAGE, "poison")
+            self.events.append(f"Poison burns for {POISON_DAMAGE} ({effects['poison']} turns left).")
+        if effects.get("weak", 0) > 0:
+            effects["weak"] -= 1
+
     def _hurt(self, amount: int, source: str) -> None:
         """All damage to the player funnels through here so the run can name its killer."""
         self.s["player"]["hp"] -= amount
@@ -561,6 +731,10 @@ class Game:
         if turn <= 0 or turn % REGEN_EVERY != 0:
             return
         player = self.s["player"]
+        # Poison stops you knitting back together, which is what makes it a threat
+        # rather than chip damage.
+        if player.get("effects", {}).get("poison"):
+            return
         if player["hp"] < player["max_hp"]:
             player["hp"] += 1
             self.events.append("You feel slightly better.")
@@ -619,6 +793,8 @@ class Game:
         self._apply(verb, args)
         if self.s["status"] == "ok":
             self._monster_turn()
+        if self.s["status"] == "ok":
+            self._tick_effects()
         self._check_end()
         # A dead run does not keep ticking: no regeneration, no further attacks on a corpse.
         if self.s["status"] == "ok":
@@ -720,7 +896,11 @@ class Game:
             self.events.append(f"You escape with the relic after {self.s['turn']} turns.")
             return
 
-        item = self.item_at(x, y)
+        # Prefer something we have not already looked at.  An item we passed on stays
+        # on the floor by design, and it must not shadow a second item on the same tile
+        # forever -- that used to make whatever sat underneath it unreachable.
+        here = [it for it in self.items if (it["x"], it["y"]) == (x, y)]
+        item = next((it for it in here if not it.get("judged")), here[0] if here else None)
         if item is not None:
             if item["kind"] == "gold":
                 player["gold"] += item["amount"]
@@ -769,6 +949,35 @@ class Game:
                         f"The {item['name']} (+{bonus} DEF) is no better than what you wear. "
                         "You leave it where it lies."
                     )
+            elif item["kind"] == "ring":
+                self.items.remove(item)
+                worn = player.get("ring")
+                if worn:
+                    player["max_hp"] -= RINGS[worn].get("max_hp", 0)
+                player["ring"] = item["name"]
+                player["max_hp"] += RINGS[item["name"]].get("max_hp", 0)
+                player["hp"] = min(player["hp"], player["max_hp"])
+                self.events.append(f"You slip on the ring of {item['name']} ({RINGS[item['name']]['note']}).")
+                if worn:
+                    # Dropped where you stand, so stepping off and back swaps it again.
+                    self.items.append(
+                        {
+                            "kind": "ring",
+                            "name": worn,
+                            "x": x,
+                            "y": y,
+                            "judged": True,
+                        }
+                    )
+                    self.events.append(f"You leave the ring of {worn} on the floor.")
+            elif item["kind"] == "key":
+                player["keys"] = player.get("keys", 0) + 1
+                self.items.remove(item)
+                self.events.append("You pick up a small iron key.")
+                if floor.get("locked"):
+                    floor["locked"] = False
+                    _set_grid_tile(floor, floor["stairs"][0], floor["stairs"][1], TILE_STAIRS)
+                    self.events.append("Something heavy unlatches below: the stairs are open.")
 
         trap = self.trap_at(x, y)
         if trap is not None and not trap["known"]:
@@ -779,11 +988,26 @@ class Game:
 
         if self.tile(x, y) == TILE_STAIRS:
             self.events.append("There are stairs leading down here.")
+        elif self.tile(x, y) == TILE_LOCKED:
+            self.events.append("The stairs down are sealed by a lock.")
 
     def _descend(self) -> None:
-        if self.s["floor"].get("stairs") != [self.px, self.py]:
+        if not self.on_stairs():
             self.events.append("There are no stairs here.")
             return
+        floor = self.s["floor"]
+        if floor.get("locked"):
+            # A key you are already carrying opens the lock.  Refusing purely because
+            # this floor's own key has not been stepped on yet would strand a player who
+            # arrived holding one -- an unwinnable state, not a puzzle.
+            if self.s["player"].get("keys", 0) > 0:
+                self.s["player"]["keys"] -= 1
+                floor["locked"] = False
+                _set_grid_tile(floor, floor["stairs"][0], floor["stairs"][1], TILE_STAIRS)
+                self.events.append("You fit the iron key into the lock and the stairs swing open.")
+            else:
+                self.events.append("The stairs are locked. Somewhere on this floor is the key.")
+                return
         depth = self.s["depth"] + 1
         if depth > self.s["max_depth"]:
             self.events.append("There is nothing below. (this should not happen)")
@@ -875,24 +1099,86 @@ class Game:
         for monster in self.monsters:
             if not monster["alive"]:
                 continue
-            here = (monster["x"], monster["y"])
-            distance = _chebyshev(here, (self.px, self.py))
-            if distance <= 1:
-                self._monster_attack(monster)
+            monster["tick"] = monster.get("tick", 0) + 1
+            # Heavy things do not act every turn, so walking away is a real option.
+            slow = monster.get("slow", 1)
+            if slow > 1 and monster["tick"] % slow != 0:
                 continue
-            if not monster["alerted"]:
-                if distance <= MONSTER_SIGHT and self._los(here, player_pos):
-                    monster["alerted"] = True
-                else:
-                    continue
-            self._monster_move(monster)
-            if monster["alive"] and _chebyshev((monster["x"], monster["y"]), (self.px, self.py)) <= 1:
-                self._monster_attack(monster)
+            # Fast things act more than once, so standing in the open is a real cost.
+            for _ in range(max(1, monster.get("speed", 1))):
+                if not monster["alive"] or self.s["status"] != "ok":
+                    break
+                self._monster_act(monster, player_pos)
+
+    def _monster_act(self, monster: dict, player_pos: tuple[int, int]) -> None:
+        here = (monster["x"], monster["y"])
+        distance = _chebyshev(here, (self.px, self.py))
+        if distance <= 1:
+            self._monster_attack(monster)
+            return
+        if not monster["alerted"]:
+            if distance <= MONSTER_SIGHT and self._los(here, player_pos):
+                monster["alerted"] = True
+            else:
+                # A shaman tends its friends whether or not it has seen you yet.
+                if monster.get("heals", 0):
+                    self._monster_heal(monster)
+                return
+        # Archers do not close in: if they can see you, they shoot.  They also have to
+        # spend a turn drawing the next arrow, which is what turns "you will take four
+        # hits walking at it" into a rhythm you can actually read and time.
+        if monster.get("ranged", 0) >= distance and self._los(here, player_pos):
+            if monster.get("reload", 1) <= 1 or monster["tick"] % monster["reload"] == 0:
+                self._monster_shoot(monster, distance)
+            else:
+                self.events.append(f"The {monster['kind']} draws its bow.")
+            return
+        if monster.get("heals", 0) and self._monster_heal(monster):
+            return
+        self._monster_move(monster)
+        if monster["alive"] and _chebyshev((monster["x"], monster["y"]), (self.px, self.py)) <= 1:
+            self._monster_attack(monster)
+
+    def _monster_heal(self, monster: dict) -> bool:
+        wounded = None
+        worst = 0.8
+        for other in self.monsters:
+            if other is monster or not other["alive"]:
+                continue
+            if _chebyshev((other["x"], other["y"]), (monster["x"], monster["y"])) > monster.get("heals", 0):
+                continue
+            ratio = other["hp"] / other["max_hp"] if other["max_hp"] else 1.0
+            if ratio < worst:
+                worst = ratio
+                wounded = other
+        if wounded is None:
+            return False
+        amount = min(wounded["max_hp"] - wounded["hp"], 3 + wounded["max_hp"] // 4)
+        wounded["hp"] += amount
+        wounded["alerted"] = wounded["alerted"] or True
+        self.events.append(f"The {monster['kind']} mends the {wounded['kind']} for {amount}.")
+        return True
+
+    def _monster_shoot(self, monster: dict, distance: int) -> None:
+        damage = max(1, monster["atk"] + self.rng.randint(0, 2) - self.p_def() // 2)
+        self._hurt(damage, _with_article(monster["kind"]))
+        self.events.append(f"The {monster['kind']} shoots you for {damage} from {distance} tiles away.")
 
     def _monster_attack(self, monster: dict) -> None:
+        player = self.s["player"]
         damage = max(1, monster["atk"] + self.rng.randint(0, 2) - self.p_def())
-        self._hurt(damage, f"a {monster['kind']}")
+        self._hurt(damage, _with_article(monster["kind"]))
         self.events.append(f"The {monster['kind']} hits you for {damage}.")
+        if monster.get("poisons", 0):
+            effects = player.setdefault("effects", {"poison": 0, "weak": 0})
+            if monster["poisons"] > effects.get("poison", 0):
+                effects["poison"] = monster["poisons"]
+                self.events.append(f"Venom works into the wound ({monster['poisons']} turns of poison).")
+        if monster.get("weakens", 0):
+            effects = player.setdefault("effects", {"poison": 0, "weak": 0})
+            if monster["weakens"] > effects.get("weak", 0):
+                effects["weak"] = monster["weakens"]
+                self.events.append(f"A cold grip saps your strength ({monster['weakens']} turns).")
 
     def _monster_move(self, monster: dict) -> None:
         here = (monster["x"], monster["y"])
@@ -1008,20 +1294,14 @@ class Game:
                 return GLYPH_RELIC
             item = self.item_at(x, y)
             if item is not None:
-                return {
-                    "gold": "$",
-                    "potion": "!",
-                    "scroll": "?",
-                    "weapon": ")",
-                    "armor": "[",
-                }[item["kind"]]
+                return ITEM_GLYPHS[item["kind"]]
         for trap in self.traps:
             if trap["known"] and trap["x"] == x and trap["y"] == y:
                 return GLYPH_TRAP
         if self.tile(x, y) == TILE_WALL:
             return TILE_WALL
-        if self.tile(x, y) == TILE_STAIRS:
-            return TILE_STAIRS
+        if self.tile(x, y) in (TILE_STAIRS, TILE_LOCKED):
+            return self.tile(x, y)
         return TILE_FLOOR if (x, y) in vis else GLYPH_REMEMBERED_FLOOR
 
     def targets(self) -> list[dict]:
@@ -1055,15 +1335,60 @@ class Game:
                     out.append({"kind": item["kind"], "name": item.get("name")})
         return out
 
+    def floor_traits(self) -> str:
+        traits = []
+        if self.s["floor"].get("dark"):
+            traits.append(f"dark (sight {DARK_RADIUS})")
+        if self.s["floor"].get("locked"):
+            traits.append("stairs locked")
+        return ", ".join(traits) if traits else "nothing unusual"
+
+    def effect_line(self) -> str:
+        """Empty when nothing is active, so the line only ever appears as a warning."""
+        effects = self.s["player"].get("effects") or {}
+        parts = []
+        if effects.get("poison"):
+            parts.append(f"poison {effects['poison']}")
+        if effects.get("weak"):
+            parts.append(f"weak {effects['weak']} (-{WEAK_PENALTY} ATK)")
+        return ", ".join(parts)
+
+    def loot(self) -> list[dict]:
+        """Everything visible that is not already underfoot, with a bearing."""
+        out = []
+        vis = self._vis_cache if self._vis_cache is not None else self.visible_tiles()
+        for item in self.items:
+            if (item["x"], item["y"]) not in vis:
+                continue
+            if (item["x"], item["y"]) == (self.px, self.py):
+                continue
+            out.append(
+                {
+                    "dir": dir_name(item["x"] - self.px, item["y"] - self.py),
+                    "kind": item["kind"],
+                    "name": item.get("name"),
+                    "x": item["x"],
+                    "y": item["y"],
+                    "judged": bool(item.get("judged")),
+                }
+            )
+        out.sort(key=lambda entry: (entry["dir"], entry["kind"], entry["name"] or ""))
+        return out
+
+    def on_stairs(self) -> bool:
+        """True when the player is standing on the way down (locked or not)."""
+        return list(self.s["floor"].get("stairs") or []) == [self.px, self.py]
+
     def stairs_state(self) -> str:
         stairs = self.s["floor"].get("stairs")
         if not stairs:
             return "none"
+        locked = " (locked)" if self.s["floor"].get("locked") else ""
         if list(stairs) == [self.px, self.py]:
-            return "here"
+            return "here" + locked
         if tuple(stairs) in self.seen:
-            return "seen"
-        return "unknown"
+            return "seen" + locked
+        return "unknown" + locked
 
     def render_text(self, full_map: bool = False, legend: bool | None = None) -> str:
         vis = self.visible_tiles()
@@ -1081,14 +1406,27 @@ class Game:
             f"DEF {self.p_def()}({player['def']}+{self.p_def() - player['def']})  "
             f"LV {player['level']}  xp {player['xp']}/{player['xp_next']}  GOLD {player['gold']}"
         )
-        gear = f"GEAR  weapon {player['weapon'] or 'none'}   armor {player['armor'] or 'none'}"
+        ring = player.get("ring")
+        gear = (
+            f"GEAR  weapon {player['weapon'] or 'none'}   armor {player['armor'] or 'none'}"
+            f"   ring {ring or 'none'}"
+        )
         if player["inventory"]:
             carried = ", ".join(
                 self.inv_label(key, player["inventory"][key]) for key in sorted(player["inventory"])
             )
         else:
             carried = "empty"
+        # The key shows up here so an agent can see it, but deliberately does *not* go
+        # into the numbered inventory: `use 1` must keep meaning the same thing.
+        if player.get("keys"):
+            carried = f"key x{player['keys']}, {carried}" if carried != "empty" else f"key x{player['keys']}"
         lines.append(f"{gear}   INV {carried}")
+
+        lines.append(f"FLOOR   {self.floor_traits()}")
+        effects = self.effect_line()
+        if effects:
+            lines.append(f"EFFECTS {effects}")
 
         lines.append("MAP")
         for row in self.map_rows(view):
@@ -1112,6 +1450,22 @@ class Game:
             )
         else:
             lines.append("GROUND   none")
+
+        loot = self.loot()
+        if loot:
+            lines.append(
+                "LOOT     "
+                + "  ".join(
+                    f"{entry['name'] or entry['kind']}({entry['dir']}"
+                    + (", judged" if entry["judged"] else "")
+                    + ")"
+                    for entry in loot[:8]
+                )
+            )
+            if len(loot) > 8:
+                lines.append(f"         ... and {len(loot) - 8} more")
+        else:
+            lines.append("LOOT     none")
 
         lines.append(f"STAIRS   {self.stairs_state()}")
 
@@ -1156,6 +1510,9 @@ class Game:
                 "gold": player["gold"],
                 "weapon": player["weapon"],
                 "armor": player["armor"],
+                "ring": player.get("ring"),
+                "keys": player.get("keys", 0),
+                "effects": dict(player.get("effects") or {}),
                 "inventory": dict(player["inventory"]),
                 "scroll_identified": self.s["scroll"]["known"],
             },
@@ -1163,6 +1520,8 @@ class Game:
             "legend": {glyph: text for glyph, text in LEGEND.items() if glyph != " "},
             "targets": self.targets(),
             "ground": self.ground(),
+            "loot": self.loot(),
+            "floor_traits": self.floor_traits(),
             "stairs": self.stairs_state(),
             "events": list(self.events),
         }
@@ -1202,6 +1561,9 @@ def new_game(
             "gold": 0,
             "weapon": None,
             "armor": None,
+            "ring": None,
+            "keys": 0,
+            "effects": {"poison": 0, "weak": 0},
             "inventory": {},
         },
         "scroll": {"kind": None, "known": False},
@@ -1240,6 +1602,12 @@ def load_game(path: str, view: str = "full", legend: bool = False) -> Game:
         doc = json.load(handle)
     if doc.get("format") != SAVE_FORMAT:
         raise ValueError(f"not a {SAVE_FORMAT} file: {path}")
+    if doc.get("version") != SAVE_VERSION:
+        # Fail here, clearly, rather than halfway through constructing a Game from a
+        # state that is missing fields this version expects.
+        raise ValueError(
+            f"save format v{doc.get('version')} is not readable by this build (v{SAVE_VERSION}): {path}"
+        )
     if doc.get("sealed"):
         raw = _xor(base64.b64decode(doc["data"])).decode("utf-8")
         state = json.loads(raw)
@@ -1303,6 +1671,24 @@ def _bot_pick(game: Game, ban: str | None = None, avoid: set | None = None) -> s
     walk_known = {(x, y) for x, y in known if game.tile(x, y) != TILE_WALL}
     inventory = player["inventory"]
 
+    # The bot's notebook.  Keeping it here (rather than in the save) is deliberate:
+    # remembering where you saw things is the *player's* job, and this is a sample
+    # player showing how to do it.  Anything you only ever see once and never walk
+    # over -- a key on the far side of the floor -- is lost forever without notes.
+    notes = getattr(game, "_bot_notes", None)
+    if notes is None:
+        notes = {}
+        game._bot_notes = notes
+    present = {(it["x"], it["y"]) for it in game.items}
+    for pos in [pos for pos in notes if pos not in present]:
+        del notes[pos]
+    for item in game.items:
+        pos = (item["x"], item["y"])
+        if item.get("judged"):
+            notes.pop(pos, None)
+        elif pos in vis:
+            notes[pos] = item["kind"]
+
     def step_ok(step: str | None) -> bool:
         if step is None or step == ban:
             return False
@@ -1327,6 +1713,15 @@ def _bot_pick(game: Game, ban: str | None = None, avoid: set | None = None) -> s
         step = _bfs_step(game, {(target["x"], target["y"])}, walk_known | {(target["x"], target["y"])})
         if step_ok(step):
             return "move " + step
+
+    # A locked staircase is a hard gate: without the key nothing else on the floor
+    # matters, so the key outranks exploring and looting.
+    if game.s["floor"].get("locked") and not player.get("keys", 0):
+        keys = [(it["x"], it["y"]) for it in game.items if it["kind"] == "key"]
+        if keys:
+            step = _bfs_step(game, set(keys), walk_known)
+            if step_ok(step):
+                return "move " + step
 
     relic = game.s["floor"].get("relic")
     if relic:
@@ -1354,7 +1749,14 @@ def _bot_pick(game: Game, ban: str | None = None, avoid: set | None = None) -> s
         if step_ok(step):
             return "move " + step
 
-    if game.stairs_state() == "here":
+    # Nothing in sight that we want: fall back on what we wrote down earlier.
+    noted = [pos for pos in notes if pos not in vis and game.tile(pos[0], pos[1]) != TILE_WALL]
+    if noted:
+        step = _bfs_step(game, set(noted), walk_known)
+        if step_ok(step):
+            return "move " + step
+
+    if game.on_stairs():
         return "descend"
 
     stairs = game.s["floor"].get("stairs")
@@ -1572,6 +1974,95 @@ def selftest(verbose: bool = True) -> int:
         else:
             best = f"seed {seed}: {game.s['status']} floor {game.s['depth']} turn {game.s['turn']}"
     check("the baseline bot wins some seeds", wins >= 1, f"wins={wins}/5 last={best}")
+
+    # 9. content tables are self-consistent
+    sample = build_floor(random.Random(5), 6, 8)
+    generated = {item["kind"] for item in sample["items"]}
+    missing = sorted(generated - set(ITEM_GLYPHS))
+    check("every generated item kind has a glyph", not missing, f"missing={missing}")
+    bad_ring = [name for name, spec in RINGS.items() if not spec.get("note")]
+    check("every ring carries a note for the player", not bad_ring, f"missing={bad_ring}")
+    unknown = [kind for kind, spec in MONSTERS.items() if "glyph" not in spec]
+    check("every monster has a glyph", not unknown, f"missing={unknown}")
+    for glyph, name in [(spec["glyph"], kind) for kind, spec in MONSTERS.items()]:
+        if LEGEND.get(glyph) is None:
+            check("every monster glyph is in the legend", False, f"{name} ({glyph}) missing")
+            break
+    else:
+        check("every monster glyph is in the legend", True)
+    undoc = [
+        kind
+        for kind, spec in MONSTERS.items()
+        if spec.get("ranged")
+        or spec.get("poisons")
+        or spec.get("heals")
+        or spec.get("weakens")
+        or spec.get("speed", 1) > 1
+        or spec.get("slow", 1) > 1
+    ]
+    check("the deep monsters have mechanics, not just stats", len(undoc) >= 4, f"found={undoc}")
+
+    # 10. a locked floor always has a reachable key, and dark floors are playable
+    locked_failures = 0
+    dark_seen = 0
+    dark_sight_ok = True
+    for seed in range(1, 40):
+        game = new_game(seed=seed, depth=8)
+        for depth in range(1, 9):
+            game._enter_floor(depth)
+            floor = game.s["floor"]
+            if floor.get("locked") and not [i for i in floor["items"] if i["kind"] == "key"]:
+                locked_failures += 1
+            if floor.get("dark"):
+                dark_seen += 1
+                if game.sight() != DARK_RADIUS:
+                    dark_sight_ok = False
+            if floor.get("locked") and floor["grid"][floor["stairs"][1]][floor["stairs"][0]] != TILE_LOCKED:
+                locked_failures += 1
+    check("every locked floor has a key", locked_failures == 0, f"failures={locked_failures}")
+    check("dark floors actually occur", dark_seen > 0, f"seen={dark_seen}")
+    check("dark floors shrink sight to the dark radius", dark_sight_ok)
+
+    # 11. the ring's max_hp is added and removed symmetrically
+    game = new_game(seed=12, depth=3)
+    player = game.s["player"]
+    base = player["max_hp"]
+    game.items.append({"kind": "ring", "name": "vigor", "x": player["x"], "y": player["y"]})
+    game._on_enter_tile(player["x"], player["y"])
+    check("a vigor ring raises max_hp", player["max_hp"] == base + 8, f"max_hp={player['max_hp']}")
+    # walk off and back: the ring we took off is dropped, then re-worn
+    spot = None
+    for dx, dy in DIRS.values():
+        if game.tile(player["x"] + dx, player["y"] + dy) != TILE_WALL:
+            spot = (player["x"] + dx, player["y"] + dy)
+            break
+    if spot:
+        game.step("move " + dir_name(spot[0] - player["x"], spot[1] - player["y"]))
+        game.step("move " + dir_name(player["x"] - game.px, player["y"] - game.py))
+        check(
+            "max_hp comes back off with the ring",
+            player["max_hp"] == base + 8,
+            f"max_hp={player['max_hp']} ring={player['ring']}",
+        )
+
+    # 12. poison suppresses regeneration
+    game = new_game(seed=12, depth=3)
+    player = game.s["player"]
+    player["max_hp"] = 400
+    player["hp"] = 300
+    player["effects"]["poison"] = 60
+    climbed = 0
+    dropped = 0
+    for _ in range(40):
+        before = player["hp"]
+        game.step("wait")
+        if player["effects"]["poison"] > 0:
+            if player["hp"] > before:
+                climbed += 1
+            dropped += 1
+        assert game.s["status"] == "ok", "a poisoned player should not die in this window"
+    check("poison stops regeneration restoring HP", climbed == 0, f"healed {climbed} times")
+    check("poison itself damages every turn", dropped == 40, f"ticked {dropped}/40")
 
     failed = [name for name, ok_, _ in results if not ok_]
     if verbose:

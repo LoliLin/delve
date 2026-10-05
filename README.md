@@ -48,24 +48,15 @@ Options that matter:
 ## What a turn looks like
 
 ```
--- DELVE  floor 1/3   turn 1   seed 42 --
+-- DELVE  floor 1/3   turn 0   seed 42 --
 HP 26/26  ATK 4(4+0)  DEF 1(1+0)  LV 1  xp 0/10  GOLD 0
-GEAR  weapon none   armor none   INV empty
+GEAR  weapon none   armor none   ring none   INV empty
+FLOOR   nothing unusual
 MAP
-               ########
-                .......
-                 #....#
-                 #....#
-             ........@#
-              .........r
-               ######.##..
-                    #.#  ##
-                    ...
-                    ...
-                    ...
-                    ###
+                                          (a 40x14 board, 2-space indented)
 TARGETS  rat(se hp 4/4)
 GROUND   none
+LOOT     none
 STAIRS   unknown
 EVENT
   - (nothing)
@@ -76,19 +67,26 @@ Then one command, and the next block:
 
 ```
 > se
--- DELVE  floor 1/3   turn 2   seed 42 --
-HP 24/26  ATK 4(4+0)  DEF 1(1+0)  LV 1  xp 0/10  GOLD 0
-...
-TARGETS  rat(e hp 4/4)
+-- DELVE  floor 1/3   turn 1   seed 42 --
+HP 26/26  ATK 4(4+0)  DEF 1(1+0)  LV 1  xp 0/10  GOLD 0
+GEAR  weapon none   armor none   ring none   INV empty
+FLOOR   nothing unusual
+MAP
+                                          (the rat is now adjacent)
+TARGETS  rat(se hp 4/4)
+GROUND   none
+LOOT     none
+STAIRS   unknown
 EVENT
-  - The rat hits you for 2.
+  - (nothing)
 RESULT ok
 ```
 
 The blocks are always in that order, with the same labels, and **the last line is always
 `RESULT <word>`** — so a harness can read the outcome with one regex and a model can read
-the board positionally instead of guessing at prose. `--format json` carries the identical
-information as data.
+the board positionally instead of guessing at prose. Lines that only sometimes appear
+(`EFFECTS`, `LOOT`, `CAUSE`, `LEGEND`) are described on the card. `--format json` carries
+the identical information as data.
 
 ## Using it as a test bed for an agent
 
@@ -186,14 +184,33 @@ mechanics.
 
 ## Balance snapshot
 
-The built-in greedy bot (`autoplay`), seeds 1..30, on this machine:
+The built-in greedy bot (`autoplay`), seeds 1..24, on this machine. `--depth` is a
+length knob more than a difficulty knob — what it changes is how long the run is and
+whether the late floors get to hurt you:
 
-| depth | wins | deaths | stalls | turns (avg) |
-|---|---|---|---|---|
-| 3 | 18/30 | 12 | 0 | 196 |
-| 5 (default) | 21/30 | 9 | 0 | 336 |
-| 8 | 21/30 | 9 | 0 | 554 |
+| depth | wins | deaths | stalls | turns (median) | final level |
+|---|---|---|---|---|---|
+| 5 | 21/24 | 3 | 0 | 612 | 8 |
+| 8 | 20/24 | 4 | 0 | 1076 | 14 |
+| 12 | 19/24 | 5 | 0 | 1713 | 19 |
+| 16 | 19/24 | 5 | 0 | 2314 | 24 |
+| 20 | 18/24 | 6 | 0 | 2949 | 27 |
 
-Roughly 70% for a bot that never uses `sense`, never identifies scrolls deliberately and
-never retreats. A competent model should beat that comfortably, which is the intended
+Two things worth reading off that table:
+
+- **The back half used to be a victory lap.** With no scaling past floor 5 the win rate
+  was flat at 80% from depth 8 to depth 20, and every death happened on or before floor 5
+  — fifteen floors of walking after the game had stopped being a game. `threat_scale()`
+  (mild HP growth past floor 5, plus a guaranteed *tactical* monster in the roster from
+  floor 7) is what puts deaths back on floors 8 and 18.
+- **Depth is still mostly a length knob, by design.** The win rate moves a little rather
+  than a lot, because the guardian is scaled to the run's final depth; what really changes
+  is how many chances the dungeon gets at you.
+
+Zero stalls across the whole table, which is the number that matters most: `stalled` means
+a run that could neither win nor die, i.e. a bug in the bot or in the game.
+
+Roughly 75–88% for a bot that never uses `sense`, never reads a scroll deliberately, never
+retreats, and does not know what a shaman does. A competent model should beat that
+comfortably, which is the intended headroom.
 shape: the interesting cost is the turns it spends, not whether it can win at all.

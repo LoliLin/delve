@@ -12,11 +12,14 @@ The point of this file is to show the intended shape of an AI player:
     paste the block into the prompt instead, but the parse is what makes "the interface
     is machine-readable" a checkable claim rather than a hope
 
-`--policy parse` is a small agent that plans with nothing but the printed board: attack
-the weakest adjacent monster, explore the floor, then take the stairs, with a sticky
-target and a written-down note for the relic (items are only drawn while visible).
-Measured on seeds 1..30 at depth 5 it wins 14 and dies 16, never stalling -- roughly
-half the game's own greedy bot, which is the headroom a real model should be claiming.
+`--policy parse` is a small agent that plans with nothing but the printed board: drink
+before trading a blow you cannot win, attack the weakest adjacent monster, explore the
+floor, then take the stairs, with a sticky target and written-down notes for things that
+are only drawn while visible -- the relic, and a key you walked past once. Measured on
+seeds 1..24 at depth 5 it wins 10 and dies 14, never stalling: roughly half the game's own
+greedy bot, which is the headroom a real model should be claiming. It loses most of its
+runs to ranged attackers, because it has no concept of cover yet -- that is the next
+thing to teach it, and a decent model should not need teaching.
 `--policy bot` runs that in-process bot for a baseline, and `--policy random` is the
 control that shows what a genuinely bad agent looks like (it stalls at the turn limit).
 
@@ -51,7 +54,7 @@ DIRS = {
 }
 OPPOSITE = {"n": "s", "s": "n", "e": "w", "w": "e", "ne": "sw", "sw": "ne", "nw": "se", "se": "nw"}
 
-MONSTER_GLYPHS = set("rbjswG")
+MONSTER_GLYPHS = set("rbjswGaghWo")
 # Only walls and never-seen space block movement.  Everything else on the board is a
 # tile the player can walk onto: floor, remembered floor, stairs, and the item glyphs
 # ($ ! ? ) [), which sit *on* floor.  Treating an item as a wall is not a cosmetic bug
@@ -68,11 +71,12 @@ VITALS_RE = re.compile(
     r"LV (?P<level>\d+)\s+xp (?P<xp>\d+)/(?P<xp_next>\d+)\s+GOLD (?P<gold>\d+)"
 )
 TARGET_RE = re.compile(r"(?P<name>[a-z]+)\((?P<dir>[a-z]{1,2}) hp (?P<hp>\d+)/(?P<max_hp>\d+)\)")
-STAIRS_RE = re.compile(r"(?m)^STAIRS\s+(here|seen|unknown|none)\s*$")
+STAIRS_RE = re.compile(r"(?m)^STAIRS\s+(here|seen|unknown|none)(?P<locked>\s+\(locked\))?\s*$")
 GROUND_RE = re.compile(r"(?m)^GROUND\s+(?P<ground>.+?)\s*$")
+EFFECTS_RE = re.compile(r"(?m)^EFFECTS\s+(?P<effects>.+?)\s*$")
 INV_RE = re.compile(r"\bINV\s+(?P<inv>.+?)\s*$", re.MULTILINE)
 RESULT_RE = re.compile(r"(?m)^RESULT (?P<result>ok|win|dead|stalled|quit)\s*$")
-ROW_RE = re.compile(r"(?m)^  (?P<row>[#.:>@a-zA-Z!?$()\[\]*^ ]+)$")
+ROW_RE = re.compile(r"(?m)^  (?P<row>[#.:>+@a-zA-Z!?$()\[\]*^= ]+)$")
 
 
 def parse_observation(text: str) -> dict:
@@ -97,9 +101,19 @@ def parse_observation(text: str) -> dict:
     stairs = STAIRS_RE.search(text)
     if stairs:
         observation["stairs"] = stairs.group(1)
+        observation["stairs_locked"] = bool(stairs.group("locked"))
     ground = GROUND_RE.search(text)
     if ground and ground.group("ground") != "none":
         observation["ground"] = [item.strip() for item in ground.group("ground").split(",")]
+    effects = EFFECTS_RE.search(text)
+    if effects:
+        parsed = {}
+        for piece in effects.group("effects").split(","):
+            bit = piece.strip()
+            if bit:
+                name, _, count = bit.partition(" ")
+                parsed[name] = int(count) if count.strip().isdigit() else 0
+        observation["effects"] = parsed
     inventory = INV_RE.search(text)
     if inventory and inventory.group("inv") != "empty":
         for raw in inventory.group("inv").split(","):
@@ -128,29 +142,50 @@ def decide(observation: dict, state: dict) -> str:
     if start is None:
         return "wait"
 
-    # 1. something next to us: hit the weakest thing we can reach
+    # 1. trouble first.  `TARGETS` gives exact HP and the header gives our ATK, so the
+    #    exception is cheap: if this swing would finish the thing next to us, swing.
+    #    Otherwise drink *before* trading blows -- at 45% HP, one more hit is the end.
     neighbours = {}
     for name, (dx, dy) in DIRS.items():
         x, y = start[0] + dx, start[1] + dy
         if 0 <= y < len(grid) and 0 <= x < len(grid[y]) and grid[y][x] in MONSTER_GLYPHS:
             neighbours[grid[y][x]] = name
-    if neighbours:
-        by_glyph_hp = {}
-        for target in observation["targets"]:
-            by_glyph_hp.setdefault(target["name"][0], target["hp"])
-        glyph = min(neighbours, key=lambda g: by_glyph_hp.get(g, 99))
-        return "move " + neighbours[glyph]
+    by_glyph_hp = {}
+    for target in observation.get("targets", []):
+        by_glyph_hp.setdefault(target["name"][0], target["hp"])
 
-    # 2. hurt with a potion in hand
-    if observation.get("hp", 1) * 100 <= observation.get("max_hp", 1) * 40 and "potion" in observation.get(
-        "inventory", {}
-    ):
+    worst = min(neighbours, key=lambda g: by_glyph_hp.get(g, 99)) if neighbours else None
+    finishing = worst is not None and by_glyph_hp.get(worst, 99) <= observation.get("atk", 0)
+
+    hp, max_hp = observation.get("hp", 1), observation.get("max_hp", 1)
+    poisoned = "poison" in observation.get("effects", {})
+    critical = hp * 100 <= max_hp * 45
+    hurt = hp * 100 <= max_hp * 60
+    if "potion" in observation.get("inventory", {}) and (poisoned or critical or (hurt and not finishing)):
         state["last"] = "use potion"
         return "use potion"
 
-    stairs = _find(grid, ">")
+    # 2. something next to us: hit the weakest thing we can reach
+    if worst is not None:
+        return "move " + neighbours[worst]
+
+    stairs = _find(grid, ">") or _find(grid, "+")
     reachable = _reachable(grid, start)
     frontier = [spot for spot in reachable if _is_frontier(grid, spot)]
+
+    # 2b. a locked staircase is a hard gate: the key is the only thing that matters.
+    #     Same note-taking problem as the relic -- the key is visible for one moment
+    #     on the way past, and never again once you walk away from it.
+    key = _find(grid, "k")
+    if key:
+        state["key"] = key
+    elif state.get("key"):
+        key = tuple(state["key"])
+    needs_key = observation.get("stairs_locked") and "key" not in observation.get("inventory", {})
+    if needs_key and key and tuple(key) in reachable:
+        step = _bfs_step(grid, start, {tuple(key)})
+        if step:
+            return _committed(step, state, start)
 
     # 3. the relic: take it and the run is won.  Items are only drawn while they are in
     # sight, so the agent writes the position down the moment it sees it -- otherwise it
