@@ -1,0 +1,45 @@
+[project]
+name = "delve"
+version = "1.0.0"
+description = "A small dungeon crawler designed to be played by an AI agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+delve = "delve:main"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "C4",  # comprehensions
+    "SIM", # simplify
+    "RUF", # ruff-specific
+    "PLC", # pylint convention
+    "PLR", # pylint refactor
+    "PLW", # pylint warnings
+]
+ignore = [
+    "PLR0911", # the CLI has many early returns; that is the clearest shape here
+    "PLR0912", # the bot policy is a priority list; branches are the point
+    "PLR0913", # a few wide signatures are fine in a single-file game
+    "PLR0915", # same for the turn pipeline
+    "PLR2004", # magic numbers: this file is a rulebook of them
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_delve.py" = ["PLR2004", "PLC0415"]
+"agent_loop.py" = ["PLC0415"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "-q"

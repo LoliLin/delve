@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# game saves -- a run file is not source
+*.json
+delve-save.json
+
+# OS noise
+.DS_Store
