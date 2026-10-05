@@ -105,8 +105,6 @@ DIR_WORDS = {
     "northwest": "nw",
     "southeast": "se",
     "southwest": "sw",
-    "up": "n",
-    "down_": "s",
 }
 FREE_COMMANDS = {"map", "status", "inv", "inventory", "help", "?", "legend", "card"}
 
@@ -227,9 +225,7 @@ def _rng_from_json(blob: list) -> tuple:
 def _rooms_overlap(a: tuple, b: tuple, pad: int = 1) -> bool:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
-    return (
-        ax - pad < bx + bw and bx - pad < ax + aw and ay - pad < by + bh and by - pad < ay + ah
-    )
+    return ax - pad < bx + bw and bx - pad < ax + aw and ay - pad < by + bh and by - pad < ay + ah
 
 
 def _center(room: tuple) -> tuple[int, int]:
@@ -351,9 +347,7 @@ def build_floor(rng: random.Random, depth: int, max_depth: int) -> dict:
 
     # monsters
     if is_boss:
-        floor["monsters"].append(
-            _make_monster("guardian", special, guardian_stats(max_depth))
-        )
+        floor["monsters"].append(_make_monster("guardian", special, guardian_stats(max_depth)))
         names = _pick_monsters(rng, depth, 2)
     else:
         names = _pick_monsters(rng, depth, 3 + depth)
@@ -445,16 +439,15 @@ class Game:
         self.s = state
         self.view = view
         self.show_legend = legend
-        self.events: list[str] = []
+        self.events: list[str] = list(self.s.get("log") or [])
+        self._hit_by = "something in the dark"
         self.rng = random.Random()
         if state.get("rng"):
             self.rng.setstate(_rng_from_json(state["rng"]))
         else:
             self.rng.seed(state["seed"] if seed is None else seed)
         self._bind_floor(
-            {(int(x), int(y)) for x, y in state["floor"].get("seen", [])}
-            if state.get("floor")
-            else set()
+            {(int(x), int(y)) for x, y in state["floor"].get("seen", [])} if state.get("floor") else set()
         )
 
     # -- state plumbing ----------------------------------------------------
@@ -527,9 +520,7 @@ class Game:
     # -- geometry ----------------------------------------------------------
 
     def _los(self, a: tuple[int, int], b: tuple[int, int]) -> bool:
-        return all(
-            self.tile(x, y) != TILE_WALL for x, y in _line(a[0], a[1], b[0], b[1])[1:-1]
-        )
+        return all(self.tile(x, y) != TILE_WALL for x, y in _line(a[0], a[1], b[0], b[1])[1:-1])
 
     def visible_tiles(self) -> set[tuple[int, int]]:
         px, py = self.px, self.py
@@ -559,6 +550,11 @@ class Game:
         self._bind_floor(set())
         player = self.s["player"]
         player["x"], player["y"] = floor["start"][0], floor["start"][1]
+
+    def _hurt(self, amount: int, source: str) -> None:
+        """All damage to the player funnels through here so the run can name its killer."""
+        self.s["player"]["hp"] -= amount
+        self._hit_by = source
 
     def _regen(self) -> None:
         turn = self.s["turn"]
@@ -624,8 +620,11 @@ class Game:
         if self.s["status"] == "ok":
             self._monster_turn()
         self._check_end()
-        self._regen()
-        self._check_end()
+        # A dead run does not keep ticking: no regeneration, no further attacks on a corpse.
+        if self.s["status"] == "ok":
+            self._regen()
+            self._check_end()
+        self.s["log"] = list(self.events)
         return ("turn", list(self.events))
 
     def _apply(self, verb: str, args: list[str]) -> None:
@@ -633,7 +632,17 @@ class Game:
             if not args:
                 self.events.append("move where? give a direction (n s e w ne nw se sw)")
                 return
-            self._try_move(args[0])
+            word = args[0]
+            # "down" means exactly one thing everywhere in this game: go down the stairs.
+            if word in ("down", "descend", "stairs", ">"):
+                self._descend()
+                return
+            if word in ("up", "ascend", "<"):
+                self.events.append(
+                    "?? there is no way up: the entrance collapsed behind you. use `down` to take the stairs."
+                )
+                return
+            self._try_move(word)
             return
         if verb in ("attack", "hit", "strike"):
             direction = args[0] if args else None
@@ -659,14 +668,14 @@ class Game:
             return
         if verb == "quit":
             self.s["status"] = "quit"
+            self.s["cause"] = f"abandoned the run on floor {self.s['depth']}"
             self.events.append("You abandon the run.")
             return
         self.events.append(f"?? unknown command: {verb}  (the turn is spent anyway)")
+        return
 
     def _try_move(self, direction: str, force_attack: bool = False) -> None:
         direction = DIR_WORDS.get(direction, direction)
-        if direction in ("down", "up"):
-            direction = {"down": "s", "up": "n"}.get(direction, direction)
         if direction not in DIRS:
             self.events.append(f"?? not a direction: {direction}  (the turn is spent anyway)")
             return
@@ -707,6 +716,8 @@ class Game:
             player["gold"] += 25
             self.events.append("You lift the relic. It is warm, and the dungeon goes quiet.")
             self.s["status"] = "win"
+            self.s["cause"] = f"took the relic on floor {self.s['depth']}"
+            self.events.append(f"You escape with the relic after {self.s['turn']} turns.")
             return
 
         item = self.item_at(x, y)
@@ -730,11 +741,16 @@ class Game:
                     player["weapon"] = item["name"]
                     self.events.append(f"You are now wielding the {item['name']} (+{bonus} ATK).")
                     self.items.remove(item)
+                elif item.get("judged"):
+                    self.events.append(
+                        f"You step over the {item['name']} again — still no better than "
+                        f"your {player['weapon']}."
+                    )
                 else:
-                    self.items.remove(item)
+                    item["judged"] = True
                     self.events.append(
                         f"The {item['name']} (+{bonus} ATK) is no better than your current weapon. "
-                        "You leave it behind."
+                        "You leave it where it lies."
                     )
             elif item["kind"] == "armor":
                 bonus = ARMORS[item["name"]]["def"]
@@ -743,17 +759,22 @@ class Game:
                     player["armor"] = item["name"]
                     self.events.append(f"You are now wearing the {item['name']} (+{bonus} DEF).")
                     self.items.remove(item)
+                elif item.get("judged"):
+                    self.events.append(
+                        f"You step over the {item['name']} again — still no better than what you wear."
+                    )
                 else:
-                    self.items.remove(item)
+                    item["judged"] = True
                     self.events.append(
                         f"The {item['name']} (+{bonus} DEF) is no better than what you wear. "
-                        "You leave it behind."
+                        "You leave it where it lies."
                     )
 
         trap = self.trap_at(x, y)
         if trap is not None and not trap["known"]:
             trap["known"] = True
             player["hp"] -= trap["damage"]
+            self._hit_by = "a trap"
             self.events.append(f"A hidden trap goes off. You take {trap['damage']} damage.")
 
         if self.tile(x, y) == TILE_STAIRS:
@@ -869,9 +890,8 @@ class Game:
                 self._monster_attack(monster)
 
     def _monster_attack(self, monster: dict) -> None:
-        player = self.s["player"]
         damage = max(1, monster["atk"] + self.rng.randint(0, 2) - self.p_def())
-        player["hp"] -= damage
+        self._hurt(damage, f"a {monster['kind']}")
         self.events.append(f"The {monster['kind']} hits you for {damage}.")
 
     def _monster_move(self, monster: dict) -> None:
@@ -924,10 +944,12 @@ class Game:
         if player["hp"] <= 0:
             player["hp"] = 0
             self.s["status"] = "dead"
+            self.s["cause"] = f"slain by {self._hit_by} on floor {self.s['depth']}"
             self.events.append(f"You die on floor {self.s['depth']}.")
             return
         if self.s["turn"] >= TURN_LIMIT:
             self.s["status"] = "stalled"
+            self.s["cause"] = f"ran out of turns on floor {self.s['depth']}"
             self.events.append("The dungeon has gone on too long. The run ends here.")
 
     # -- rendering ---------------------------------------------------------
@@ -1059,9 +1081,7 @@ class Game:
             f"DEF {self.p_def()}({player['def']}+{self.p_def() - player['def']})  "
             f"LV {player['level']}  xp {player['xp']}/{player['xp_next']}  GOLD {player['gold']}"
         )
-        gear = (
-            f"GEAR  weapon {player['weapon'] or 'none'}   armor {player['armor'] or 'none'}"
-        )
+        gear = f"GEAR  weapon {player['weapon'] or 'none'}   armor {player['armor'] or 'none'}"
         if player["inventory"]:
             carried = ", ".join(
                 self.inv_label(key, player["inventory"][key]) for key in sorted(player["inventory"])
@@ -1076,9 +1096,7 @@ class Game:
 
         targets = self.targets()
         if targets:
-            joined = "  ".join(
-                f"{t['name']}({t['dir']} hp {t['hp']}/{t['max_hp']})" for t in targets
-            )
+            joined = "  ".join(f"{t['name']}({t['dir']} hp {t['hp']}/{t['max_hp']})" for t in targets)
             lines.append("TARGETS  " + joined)
         else:
             lines.append("TARGETS  none")
@@ -1105,9 +1123,12 @@ class Game:
         else:
             lines.append("  - (nothing)")
 
-        lines.append(f"RESULT {self.s['status']}")
+        if self.s.get("cause"):
+            lines.append("CAUSE    " + self.s["cause"])
         if legend if legend is not None else self.show_legend:
             lines.append(self.legend_block())
+        # RESULT is always the final line: a harness that runs `tail -1` must never read anything else.
+        lines.append(f"RESULT {self.s['status']}")
         return "\n".join(lines)
 
     def render_json(self) -> dict:
@@ -1116,6 +1137,7 @@ class Game:
         player = self.s["player"]
         return {
             "result": self.s["status"],
+            "cause": self.s.get("cause"),
             "game_version": GAME_VERSION,
             "seed": self.s["seed"],
             "floor": self.s["depth"],
@@ -1165,6 +1187,8 @@ def new_game(
         "max_depth": int(depth),
         "turn": 0,
         "status": "ok",
+        "cause": None,
+        "log": [],
         "player": {
             "x": 0,
             "y": 0,
@@ -1288,9 +1312,7 @@ def _bot_pick(game: Game, ban: str | None = None, avoid: set | None = None) -> s
                 return False
         return True
 
-    adjacent = [
-        m for m in game.live_monsters() if _chebyshev((m["x"], m["y"]), (game.px, game.py)) == 1
-    ]
+    adjacent = [m for m in game.live_monsters() if _chebyshev((m["x"], m["y"]), (game.px, game.py)) == 1]
     hurt = player["hp"] * 100 <= player["max_hp"] * 40
     if hurt and inventory.get("potion", 0) > 0 and not adjacent:
         return "use potion"
@@ -1324,7 +1346,9 @@ def _bot_pick(game: Game, ban: str | None = None, avoid: set | None = None) -> s
         if step_ok(step):
             return "move " + step
 
-    visible_items = [(it["x"], it["y"]) for it in game.items if (it["x"], it["y"]) in vis]
+    visible_items = [
+        (it["x"], it["y"]) for it in game.items if (it["x"], it["y"]) in vis and not it.get("judged")
+    ]
     if visible_items:
         step = _bfs_step(game, set(visible_items), walk_known)
         if step_ok(step):
@@ -1483,9 +1507,7 @@ def selftest(verbose: bool = True) -> int:
             kind, _ = game.step("map")
             vis = game.visible_tiles()
             rows = game.map_rows()
-            hidden = [
-                m for m in game.live_monsters() if (m["x"], m["y"]) not in vis
-            ]
+            hidden = [m for m in game.live_monsters() if (m["x"], m["y"]) not in vis]
             for monster in hidden:
                 glyph = rows[monster["y"]][monster["x"]]
                 if glyph == MONSTERS[monster["kind"]]["glyph"]:

@@ -437,16 +437,29 @@ def test_better_gear_equips_itself_and_worse_gear_does_not():
     assert player["weapon"] == "rune blade"
 
 
-def test_a_leavable_item_is_removed_so_the_tile_cannot_be_farmed():
-    """A bot that re-evaluates the same item forever is a stalled run."""
+def test_a_leavable_item_stays_on_the_floor_and_is_marked_judged():
+    """The world must agree with the message.
+
+    This used to delete the item, which contradicts "You leave it where it lies".
+    The real fix is that the item stays and remembers it was judged, so the bot can
+    learn to stop targeting it instead of the game quietly rewriting the map.
+    """
     game = new_game(seed=2, depth=4)
     player = game.s["player"]
     player["weapon"] = "rune blade"
-    game.items.append({"kind": "weapon", "name": "dagger", "x": player["x"], "y": player["y"]})
-    game._on_enter_tile(player["x"], player["y"])
-    assert not [
-        i for i in game.items if (i["x"], i["y"]) == (player["x"], player["y"]) and i["kind"] == "weapon"
-    ]
+    tile = (player["x"], player["y"])
+    game.items.append({"kind": "weapon", "name": "dagger", "x": tile[0], "y": tile[1]})
+    game._on_enter_tile(tile[0], tile[1])
+    left = [i for i in game.items if (i["x"], i["y"]) == tile and i["kind"] == "weapon"]
+    assert len(left) == 1, "the item must stay where it lies"
+    assert left[0]["judged"] is True
+    assert "leave it where it lies" in " ".join(game.events)
+
+    # a second visit says something different and does not try to re-evaluate
+    game.events.clear()
+    game._on_enter_tile(tile[0], tile[1])
+    assert game.events and "again" in game.events[0]
+    assert len([i for i in game.items if (i["x"], i["y"]) == tile and i["kind"] == "weapon"]) == 1
 
 
 def test_regeneration_ticks_on_the_documented_interval():
@@ -784,3 +797,176 @@ def test_the_stairs_tile_is_marked_in_the_grid():
 def test_chebyshev_is_eight_way_distance():
     assert _chebyshev((0, 0), (1, 1)) == 1
     assert _chebyshev((0, 0), (3, 0)) == 3
+
+
+# --------------------------------------------------------------------------
+# regressions found by actually playing the thing
+# --------------------------------------------------------------------------
+
+
+def test_a_dead_run_does_not_keep_ticking():
+    """A corpse must not regenerate, and monsters must stop hitting it.
+
+    Regression: the turn used to run ``_regen()`` unconditionally after ``_check_end()``,
+    so a run killed by a monster then healed the corpse back to 1 HP -- leaving
+    ``status=dead`` with ``hp=1``, a self-contradicting state for any agent reading it.
+    """
+    game = new_game(seed=11, depth=5)
+    player = game.s["player"]
+    player["hp"] = 1
+    # walk until something kills us, then keep the state pristine after death
+    for _ in range(delve.TURN_LIMIT):
+        if game.s["status"] != "ok":
+            break
+        game.step("wait")
+    assert game.s["status"] in {"dead", "stalled"}
+    assert game.s["status"] != "dead" or player["hp"] == 0
+    # once the run is over, pumping more turns must not change the state at all
+    frozen = json.dumps(game.s, sort_keys=True)
+    for _ in range(5):
+        game.step("wait")
+    assert json.dumps(game.s, sort_keys=True) == frozen
+
+
+def test_a_live_turn_still_regenerates():
+    game = new_game(seed=11, depth=5)
+    player = game.s["player"]
+    player["hp"] = max(2, player["max_hp"] // 2)
+    before = player["hp"]
+    for _ in range(20):
+        game.step("wait")
+    assert player["hp"] > before, "regeneration must still happen while alive"
+
+
+def test_every_finished_run_names_a_cause():
+    for seed in range(1, 25):
+        game = new_game(seed=seed, depth=5)
+        for _ in range(delve.TURN_LIMIT + 20):
+            if game.s["status"] != "ok":
+                break
+            game.step(delve.bot_command(game))
+        if game.s["status"] == "ok":
+            continue
+        assert game.s["cause"], f"seed {seed} ended as {game.s['status']} with no cause"
+        assert game.s["cause"] in game.render_text()
+
+
+def test_quit_names_itself_as_the_cause():
+    game = new_game(seed=3, depth=3)
+    game.step("quit")
+    assert game.s["status"] == "quit"
+    assert "abandoned" in game.s["cause"]
+
+
+def test_death_cause_names_the_killer():
+    game = new_game(seed=11, depth=5)
+    player = game.s["player"]
+    player["hp"] = 1
+    # put a real threat next to the player instead of hoping one wanders over
+    game.s["floor"]["monsters"].append(
+        {
+            "kind": "wraith",
+            "x": player["x"] + 1,
+            "y": player["y"],
+            "hp": 20,
+            "max_hp": 20,
+            "atk": 9,
+            "def": 0,
+            "xp": 5,
+            "alive": True,
+            "alerted": True,
+        }
+    )
+    for _ in range(50):
+        if game.s["status"] != "ok":
+            break
+        game.step("wait")
+    assert game.s["status"] == "dead"
+    assert game.s["cause"] == "slain by a wraith on floor 1", game.s["cause"]
+    assert game.s["player"]["hp"] == 0
+    assert "CAUSE" in game.render_text()
+
+
+def test_the_last_log_survives_a_reload(tmp_save):
+    """Reading the same save twice must give the same answer.
+
+    Regression: the event log lived only in memory, so a reloaded save rendered
+    ``EVENT - (nothing)`` for the turn the player had just taken.
+    """
+    game = new_game(seed=4, depth=4)
+    game.step("e")
+    save_game(tmp_save, game)
+    back = load_game(tmp_save)
+    assert back.events == game.events
+    assert back.render_text() == game.render_text()
+
+
+def test_result_is_always_the_final_line():
+    game = new_game(seed=4, depth=4)
+    for legend in (False, True):
+        game.show_legend = legend
+        lines = game.render_text().splitlines()
+        assert lines[-1] == f"RESULT {game.s['status']}"
+        assert lines[-1].startswith("RESULT ")
+
+
+def test_result_is_the_final_line_even_after_the_run_ends():
+    game = new_game(seed=4, depth=4)
+    game.step("quit")
+    game.show_legend = True
+    assert game.render_text().splitlines()[-1] == "RESULT quit"
+
+
+def test_move_down_means_descend_not_south():
+    """`down` must mean exactly one thing: the stairs.  Silently walking south instead
+    is the kind of quiet wrong answer that burns an agent's whole run."""
+    game = new_game(seed=5, depth=4)
+    player = game.s["player"]
+    game.events.clear()
+    game.step("move down")
+    assert game.events and "no stairs" in " ".join(game.events).lower()
+    assert (player["x"], player["y"]) == (game.s["player"]["x"], game.s["player"]["y"])
+
+    # standing on the stairs, "move down" really descends
+    x, y = game.s["floor"]["stairs"]
+    player["x"], player["y"] = x, y
+    depth_before = game.s["depth"]
+    game.step("move down")
+    assert game.s["depth"] == depth_before + 1
+
+
+def test_move_up_is_refused_with_an_explanation():
+    game = new_game(seed=5, depth=4)
+    player = game.s["player"]
+    start = (player["x"], player["y"])
+    game.step("move up")
+    assert "no way up" in " ".join(game.events)
+    assert (game.s["player"]["x"], game.s["player"]["y"]) == start
+
+
+def test_direction_words_no_longer_swallow_up_and_down():
+    assert "up" not in delve.DIR_WORDS
+    assert "down" not in delve.DIR_WORDS
+    assert delve.DIR_WORDS["north"] == "n"
+
+
+def test_judged_junk_does_not_stall_a_run():
+    """The bot must learn to ignore what it already passed on, rather than the game
+    deleting the item to stop it looping."""
+    for seed in range(1, 31):
+        game = new_game(seed=seed, depth=5)
+        player = game.s["player"]
+        player["weapon"] = "rune blade"
+        player["armor"] = "plate"
+        # scatter junk the bot can see but never wants, right around the start
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)):
+            x, y = player["x"] + dx, player["y"] + dy
+            if game.tile(x, y) == TILE_WALL:
+                continue
+            game.items.append({"kind": "weapon", "name": "dagger", "x": x, "y": y})
+            game.items.append({"kind": "armor", "name": "rags", "x": x, "y": y})
+        for _ in range(delve.TURN_LIMIT):
+            if game.s["status"] != "ok":
+                break
+            game.step(delve.bot_command(game))
+        assert game.s["status"] != "stalled", f"seed {seed} stalled on judged junk"
